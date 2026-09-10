@@ -1,0 +1,18 @@
+{
+    "display_name": "SillyToken · 用量统计",
+    "loading_order": 500,
+    "minimum_client_version": "1.12.0",
+    "requires": [],
+    "optional": [],
+    "js": "bootstrap.js",
+    "css": "style.css",
+    "author": "Operit（原 TokenFlow 作者）· SillyToken 修改版",
+    "version": "2.3.0",
+    "homePage": "https://github.com/duyun47/sillytoken",
+    "auto_update": false,
+    "i18n": {
+        "zh-cn": "i18n/zh-cn.json",
+        "zh-tw": "i18n/zh-tw.json",
+        "en": "i18n/en.json"
+    }
+}
