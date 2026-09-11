@@ -202,5 +202,9 @@
   "清除": "Clear",
   "自定义": "Custom",
   "点这里选起止日期": "Pick a start and end date",
-  "有 {n} 天的旧记录没有按模型明细，只计入总计": "{n} older days have no per-model detail and are counted in totals only"
+  "有 {n} 天的旧记录没有按模型明细，只计入总计": "{n} older days have no per-model detail and are counted in totals only",
+  "备份时间": "Backup time",
+  "价格表条目": "Price table entries",
+  "导入会覆盖当前全部统计与价格设置，且无法撤销。": "Importing replaces all current stats and price settings. This cannot be undone.",
+  "确定继续？": "Continue?"
 }

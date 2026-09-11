@@ -606,6 +606,23 @@ function pushCaptureMiss(url, model, reason) {
     while (CAPTURE_STATS.lastMissed.length > 10) CAPTURE_STATS.lastMissed.shift();
 }
 
+/**
+ * 「精确追踪」开关必须在调用时读，不能只在启动时读一次。
+ *
+ * 旧版把判断写在 initialize() 里（if (settings.trackExact) installCaptureLayer()），
+ * 于是：启动后再勾上 = 抓取层永远不会装（用户以为开了，其实一条都不记）；
+ * 取消勾选 = 拦截器照旧在跑（用户以为关了，其实还在抓）。
+ *
+ * 关掉时不做卸载，而是让补丁层直接透传：抢回 window.fetch 很可能把别的
+ * 扩展后来包的层一起丢掉，透传则只影响我们自己。
+ */
+function captureEnabled() {
+    try {
+        const s = getSettings();
+        return !s || s.trackExact !== false;
+    } catch { return true; }
+}
+
 /* ---------- 窗口发现：自身 + parent + top + 递归同源 iframe ---------- */
 
 function safeSelfWindow() {
@@ -958,6 +975,25 @@ function resolveRequestUrl(input) {
 
 /* ---------- 层 1：fetch（用属性访问器，宿主重写也逃不掉） ---------- */
 
+/**
+ * 透传（不记账）也必须走深度保护。
+ *
+ * 宿主有时会把 fetch 包成「转调我们这一层」：`const o = fetch; fetch = (...a) => o(...a)`。
+ * 这种情况下 state.delegateFetch 绕回我们自己的 patchedFetch ——
+ * 旧版直接 `return state.delegateFetch(...args)`，于是在
+ *   · 请求不是生成端点（状态查询、其它 API），或
+ *   · 精确追踪开关被关掉
+ * 时会自己调自己，一路递归到栈溢出，而这个异常发生在别人的 await 里，
+ * 面板上只会看到请求全部失败。
+ *
+ * 深度 >0 时改调最初那个 fetch（bypassFetch），环路就断开了。
+ */
+function passthroughFetch(state, args) {
+    if (state.fetchDepth > 0) return (state.bypassFetch || state.delegateFetch)(...args);
+    state.fetchDepth += 1;
+    try { return state.delegateFetch(...args); } finally { state.fetchDepth -= 1; }
+}
+
 function patchFetchOnWindow(win, state) {
     let current = null;
     try { current = typeof win.fetch === 'function' ? win.fetch : null; } catch { return; }
@@ -986,7 +1022,8 @@ function createPatchedFetch(win, state) {
         const input = args[0];
         const init = args[1];
         const url = resolveRequestUrl(input);
-        if (!isCaptureTarget(url)) return state.delegateFetch(...args);
+        // 开关关掉时直接透传：补丁还挂在 fetch 上，但不解析 payload、不建记录。
+        if (!captureEnabled() || !isCaptureTarget(url)) return passthroughFetch(state, args);
 
         const payload = await readRequestPayload(input, init);
         const capture = acquireCapture(payload, url, win, false);
@@ -1058,7 +1095,7 @@ function patchXhrOnWindow(win, state) {
             return rawOpen.call(xhr, method, url, ...rest);
         };
         xhr.send = function patchedSend(body) {
-            if (isCaptureTarget(requestUrl)) {
+            if (captureEnabled() && isCaptureTarget(requestUrl)) {
                 let payload = null;
                 try { payload = typeof body === 'string' ? JSON.parse(body) : null; } catch { payload = null; }
                 const capture = acquireCapture(payload, requestUrl, win, false);
@@ -1148,6 +1185,7 @@ function patchHostFunctionsOnWindow(win, state) {
 
     const original = entry ? entry.original : helper.generateRaw;
     const patched = function patchedGenerateRaw(...args) {
+        if (!captureEnabled()) return original.apply(this, args);
         const payload = generateRawArgsToPayload(args);
         const capture = acquireCapture(payload, 'TavernHelper.generateRaw', win, true);
 
@@ -1229,6 +1267,12 @@ function installCaptureLayer() {
 
 // 兼容旧调用名
 const installFetchInterceptor = installCaptureLayer;
+
+function stopCaptureWatchdog() {
+    if (!captureWatchdog) return;
+    try { clearInterval(captureWatchdog); } catch { /* ignore */ }
+    captureWatchdog = null;
+}
 
 /* ============================================================
  *  UI：设置面板
@@ -1772,10 +1816,25 @@ function applyTheme() {
     }
 }
 
+let tfRenderQueued = false;
+let tfRenderTimer = null;
+
 function safeUpdateUI() {
     // 面板渲染一旦抛异常，整块 UI 会变空白；用户设备上没有 DevTools，
     // 所以这里兜一层，并把异常写进运行日志（面板底部能看到）。
+    //
+    // 同时把同一帧里的多次请求合并成一次重绘：一次点击常常连着触发
+    // 好几条 safeUpdateUI（改设置 → 重算 → 重画），旧版会排队排出一串
+    // 全量重绘 —— 上千条历史记录时点一下要卡好几秒。
+    if (tfRenderQueued) return;
+    tfRenderQueued = true;
     const run = () => {
+        if (!tfRenderQueued) return;   // 已被另一条路径先跑掉了
+        tfRenderQueued = false;
+        if (tfRenderTimer !== null) {
+            try { clearTimeout(tfRenderTimer); } catch { /* ignore */ }
+            tfRenderTimer = null;
+        }
         try {
             updateDashboard();
         } catch (error) {
@@ -1783,6 +1842,10 @@ function safeUpdateUI() {
         }
     };
     if (typeof requestAnimationFrame === 'function') {
+        // 后台标签页 / 熄屏时 rAF 不触发，旧版会一直停在「已排队」状态，
+        // 回前台才补一次。定时器兜底保证最长约 0.8 秒内必定重绘一次。
+        // 先挂定时器再挂 rAF：rAF 跑起来时会把它清掉。
+        if (typeof setTimeout === 'function') tfRenderTimer = setTimeout(run, 800);
         requestAnimationFrame(run);
     } else {
         run();
@@ -2124,6 +2187,24 @@ function addExtensionSettingsInto(content) {
     const sw2 = mkCheck('trackExact');
     sw2.append(document.createTextNode(safeT('捕获真实 API usage')));
     row(span(safeT('精确追踪')), sw2);
+    // 旧版只在 initialize() 里读一次 trackExact：启动后再勾上，抓取层
+    // 永远不会装（用户以为开了，其实一条都不记）；取消勾选则照旧在抓。
+    const sw2Input = sw2.querySelector('input');
+    sw2Input.addEventListener('change', () => {
+        if (sw2Input.checked) {
+            try {
+                installCaptureLayer();
+                tfLog('info', 'capture.toggle', '已开启精确追踪');
+            } catch (e) {
+                tfLog('error', 'capture.install', '补装捕获层失败: ' + (e?.message || e));
+            }
+        } else {
+            // 只停看门狗，补丁层留着透传：抢回 window.fetch 会把别的扩展
+            // 后来包的层一起丢掉，透传则只影响我们自己。
+            stopCaptureWatchdog();
+            tfLog('info', 'capture.toggle', '已关闭精确追踪：之后的请求不再记账，本地估算兜底仍可用');
+        }
+    });
 
     const sw3 = mkCheck('useFallback');
     sw3.append(document.createTextNode(safeT('本地估算兜底')));
@@ -2397,6 +2478,21 @@ function addExtensionSettingsInto(content) {
                 try {
                     const parsed = JSON.parse(reader.result);
                     if (parsed && parsed.settings) {
+                        // 导入是整块覆盖：当前统计与价格表全被换掉，而且没有撤销。
+                        // 面板上「导出数据」和「导入数据」就挨着，点错一下数据就没了，
+                        // 所以先把「要覆盖什么、覆盖成什么」摆出来让用户确认。
+                        const meta = [];
+                        if (parsed.exportedAt) {
+                            try { meta.push(safeT('备份时间') + ': ' + new Date(parsed.exportedAt).toLocaleString()); } catch { /* 时间戳不可信，忽略 */ }
+                        }
+                        if (Array.isArray(parsed.settings.models)) meta.push(safeT('价格表条目') + ': ' + parsed.settings.models.length);
+                        const ask = (typeof globalThis.confirm === 'function') ? globalThis.confirm : null;
+                        if (ask) {
+                            const msg = safeT('导入会覆盖当前全部统计与价格设置，且无法撤销。')
+                                + '\n\n' + meta.join('\n') + (meta.length ? '\n\n' : '')
+                                + safeT('确定继续？');
+                            if (!ask(msg)) return;
+                        }
                         // 只接受已知字段，并挡掉 __proto__ / constructor —— 导入的 JSON 是不可信输入
                         const incoming = (parsed.settings && typeof parsed.settings === 'object') ? parsed.settings : {};
                         const safeIncoming = {};
@@ -2521,7 +2617,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.4.0';
+const TF_VERSION = '2.5.0';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;

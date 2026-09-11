@@ -7,7 +7,7 @@
     "js": "bootstrap.js",
     "css": "style.css",
     "author": "Operit（原 TokenFlow 作者）· SillyToken 修改版",
-    "version": "2.4.0",
+    "version": "2.5.0",
     "homePage": "https://github.com/duyun47/sillytoken",
     "auto_update": false,
     "i18n": {
