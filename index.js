@@ -70,6 +70,7 @@ const defaultSettings = {
     lastDailyReport: '',               // 记录最近一次简报日期，避免重复
     autoArchive: true,                 // 是否自动归档
     archiveDays: 365,                  // 历史归档保留天数（「全部」视图要靠它）
+    statsRange: { mode: 'preset', id: '7d', from: '', to: '' },   // 面板当前选的时间范围
     // ===== v1.2.0：五套大师级主题 =====
     theme: 'aurora-midnight',          // 默认主题
     // ===== v1.3.0：Gemini 风格用量限额 =====
@@ -106,7 +107,12 @@ function getSettings() {
     const OBSOLETE = ['gpt-4o', 'gpt-4o-mini', 'gpt-5', 'deepseek-chat', 'deepseek-reasoner', 'qwen3.5-plus', 'mimo-v2.5-pro'];
     const NEEDS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'deepseek-v4-flash', 'deepseek-v4-pro', 'gemini-3.7-flash'];
     const outdatedVersion = (s.modelVersion || 0) < (defaultSettings.modelVersion || 0);
-    const hasObsolete = OBSOLETE.some(dep => s.models.some(m => String(m.name).toLowerCase().includes(dep)));
+    // 必须精确或「前缀 + 连字符」匹配：旧版用 includes，OBSOLETE 里的 'gpt-5'
+    // 命中了内置的 'gpt-5.6-sol'，于是 hasObsolete 永远为真、每次 getSettings() 都重建价格表
+    const hasObsolete = OBSOLETE.some((dep) => s.models.some((m) => {
+        const name = String((m && m.name) || '').toLowerCase().trim();
+        return name === dep || name.startsWith(dep + '-') || name.startsWith(dep + '_');
+    }));
     const missingFlagships = NEEDS.some(need => !s.models.some(m => String(m.name).toLowerCase() === need));
     if (outdatedVersion || hasObsolete || missingFlagships) {
         // v2.1.0：不再整体覆盖。预设只负责「补新」，用户改过的条目原样保留 ——
@@ -118,7 +124,13 @@ function getSettings() {
             const existing = remaining.get(key);
             remaining.delete(key);
             if (existing && existing.userEdited) fresh.push(existing);   // 用户改过 → 尊重用户
-            else if (existing) fresh.push({ ...preset, userEdited: false });
+            else if (existing) {
+                // 值没变就复用原对象。旧版无条件新建对象，会让设置面板里
+                // 已经打开的输入框闭包指向一个「脱离」的对象 —— 你敲进去的价格被静默丢弃
+                const same = ['input', 'output', 'cached', 'perRequest'].every(
+                    (f) => Number(existing[f] || 0) === Number(preset[f] || 0));
+                fresh.push(same ? existing : { ...preset, userEdited: false });
+            }
             else fresh.push(preset);                                     // 新增的预设型号
         }
         for (const [lower, entry] of remaining) {
@@ -146,6 +158,7 @@ function getSettings() {
     if (!s.dailyStats.models || typeof s.dailyStats.models !== 'object') s.dailyStats.models = {};
     if (!s.budget || typeof s.budget !== 'object') s.budget = { enabled: false, dailyLimit: 0, monthlyLimit: 0 };
     if (typeof s.contextSize !== 'number') s.contextSize = 128000;
+    if (typeof s.archiveDays !== 'number' || !Number.isFinite(s.archiveDays) || s.archiveDays <= 0) s.archiveDays = 365;
     // ===== v1.3.0 兜底：Gemini 用量限额 =====
     if (!s.geminiQuota || typeof s.geminiQuota !== 'object') {
         s.geminiQuota = structuredClone(defaultSettings.geminiQuota);
@@ -168,7 +181,8 @@ const TF_EMPTY_PRICE = { input: 0, output: 0, cached: 0, perRequest: 0, multipli
 // 返回里带 matchedBy / matchedName：让「用了哪一档价格」永远可见，
 // 不再出现静默按 0 计费、或静默命中同族里最贵一档的情况。
 function getPriceFor(settings, model) {
-    const models = Array.isArray(settings?.models) ? settings.models : [];
+    // 过滤掉非对象项：导入的备份里可能混进 null（旧版会直接抛异常，把整个面板搞空）
+    const models = (Array.isArray(settings?.models) ? settings.models : []).filter((m) => m && typeof m === 'object');
     const key = tfCanonicalModel(model);
     if (!key) return { ...TF_EMPTY_PRICE, name: model, matchedBy: 'none', matchedName: null };
 
@@ -301,6 +315,10 @@ function recordUsage(model, inTok, outTok, cachedTok, isEstimate, requests = 1) 
     dailyModel.out += outTok || 0;
     dailyModel.cached += cachedTok || 0;
     dailyModel.req += requests;
+    // 费用必须一起累加：之前这里只加了 in/out/cached/req/est/unpriced，
+    // 漏了 cost，于是「今天」的按模型费用恒为 0 —— 当天明细全是 $0，
+    // 而且 近7天/近30天 的合计会整块少算今天这一天的钱。
+    dailyModel.cost = (dailyModel.cost || 0) + cost.usd;
     if (isEstimate) dailyModel.est = (dailyModel.est || 0) + 1;
     if (cost.price && cost.price.matchedBy === 'none') dailyModel.unpriced = (dailyModel.unpriced || 0) + 1;
     checkBudgetAlert(s, cost.usd);
@@ -420,8 +438,15 @@ function maybeArchive(s) {
     // 一并存下当天的按模型用量，以后补价格时这条历史记录也能重算
     if (s.dailyStats && s.dailyStats.models) rec.models = structuredClone(s.dailyStats.models);
     // 保留最近 N 天
-    const cutoff = Date.now() - (s.archiveDays || 365) * 86400000;
-    s.history = s.history.filter(h => new Date(h.date + 'T00:00:00').getTime() >= cutoff);
+    // archiveDays 可能被脏数据写成字符串/对象 → NaN → 会把全部历史（含今天）删光，
+    // 而且每次请求都再删一次。解析不出日期的行也保留，不静默丢。
+    const keepDays = Number(s.archiveDays);
+    const cutoff = Date.now() - (Number.isFinite(keepDays) && keepDays > 0 ? keepDays : 365) * 86400000;
+    s.history = s.history.filter((h) => {
+        if (!h || !h.date) return false;
+        const ts = new Date(h.date + 'T00:00:00').getTime();
+        return Number.isFinite(ts) ? ts >= cutoff : true;
+    });
 }
 
 // 上下文占用监控（估算当前聊天上下文 token 占用比例）
@@ -966,17 +991,24 @@ function createPatchedFetch(win, state) {
         const payload = await readRequestPayload(input, init);
         const capture = acquireCapture(payload, url, win, false);
 
+        // 守卫只覆盖「同步派发」这一段。旧版让它跨越整个 await，
+        // 于是模型思考期间（10-60 秒）由别的脚本发出的第二个请求会走 bypass 分支，
+        // 既不记 seen 也不记 missed —— 直接漏记。
         state.fetchDepth += 1;
-        let response;
+        let pending;
         try {
             // 只调用一次。旧版在这里的 catch 之后还会再调一次 originalFetch，
             // 网络失败或用户点「停止」产生 AbortError 时会把同一个请求重发一遍。
-            response = await state.delegateFetch(...args);
+            pending = state.delegateFetch(...args);
+        } finally {
+            state.fetchDepth -= 1;
+        }
+        let response;
+        try {
+            response = await pending;
         } catch (error) {
             finishCapture(capture, { reason: '请求失败: ' + (error?.message || error), estimate: false });
             throw error;
-        } finally {
-            state.fetchDepth -= 1;
         }
 
         trackResponse(response, capture);
@@ -1102,7 +1134,17 @@ function patchHostFunctionsOnWindow(win, state) {
 
     let entry = state.hostPatches.find((p) => p.key === 'generateRaw') || null;
     if (entry && helper.generateRaw === entry.patched) return;
-    if (entry && helper.generateRaw !== entry.original) entry.original = helper.generateRaw;
+    if (entry) {
+        // 宿主每次换掉函数我们都得重新包一层，但如果对方是在包我们的补丁，
+        // 这样会一层层叠加（两个窗口可达同一对象时 500ms 看门狗会让它无限增长）。
+        // 给它一个上限，超过就不再叠。
+        entry.wraps = (entry.wraps || 0) + 1;
+        if (entry.wraps > 3) {
+            tfLog('warn', 'capture.hostWrapLimit', '宿主反复改写 generateRaw，已达包装上限，停止叠加', { wraps: entry.wraps });
+            return;
+        }
+        if (helper.generateRaw !== entry.original) entry.original = helper.generateRaw;
+    }
 
     const original = entry ? entry.original : helper.generateRaw;
     const patched = function patchedGenerateRaw(...args) {
@@ -1485,17 +1527,13 @@ function updateDashboard() {
 // 计算当日周期内的用量（按当前 metric）
 function quotaMetricUsage(s, windowStartTs) {
     const metric = (s.geminiQuota && s.geminiQuota.metric) || 'tokens';
-    // dailyStats 只有今日累计；此函数用于匹配 json mode 下的"周期内"用量
-    const d = s.dailyStats || {};
-    // 对于日周期直接用今日累计（hourly 之前的全部）
-    const now = Date.now();
-    // 简单处理：日周期内用量 = 今日累计
+    // 隔夜后 dailyStats 里还是昨天的数，不能当「今天」用
+    const d = tfTodayStats(s);
     if (metric === 'cost') return d.cost || 0;
     if (metric === 'requests') return d.req || 0;
     return d.tokens || 0;
 }
 
-// 计算本周累计用量：累加 history 中本周发生的历史 + 今日
 function quotaWeeklyUsage(s) {
     const cfg = s.geminiQuota || {};
     const metric = cfg.metric || 'tokens';
@@ -2243,6 +2281,10 @@ function addExtensionSettingsInto(content) {
     resetAll.addEventListener('click', () => {
         s.stats = structuredClone(defaultSettings.stats);
         s.session = structuredClone(defaultSettings.session);
+        // 旧版漏了这几项：总量归零了，但 7 天/30 天/全部视图照样显示全部历史 —— 等于没擦
+        s.history = [];
+        s.dailyStats = { cost: 0, tokens: 0, req: 0, models: {}, date: _todayStr() };
+        s.lastDailyReport = '';
         saveSettingsDebounced(); updateDashboard();
     });
     const resetSession = document.createElement('button');
@@ -2355,8 +2397,20 @@ function addExtensionSettingsInto(content) {
                 try {
                     const parsed = JSON.parse(reader.result);
                     if (parsed && parsed.settings) {
-                        Object.assign(extension_settings[MODULE], parsed.settings);
-                        recomputeAllCosts(getSettings());
+                        // 只接受已知字段，并挡掉 __proto__ / constructor —— 导入的 JSON 是不可信输入
+                        const incoming = (parsed.settings && typeof parsed.settings === 'object') ? parsed.settings : {};
+                        const safeIncoming = {};
+                        for (const key of Object.keys(incoming)) {
+                            if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+                            if (!Object.prototype.hasOwnProperty.call(defaultSettings, key)) continue;
+                            safeIncoming[key] = incoming[key];
+                        }
+                        Object.assign(extension_settings[MODULE], safeIncoming);
+                        const imported = getSettings();
+                        if (typeof imported.displayCurrency === 'string') imported.displayCurrency = imported.displayCurrency.slice(0, 8);
+                        if (!Array.isArray(imported.models)) imported.models = structuredClone(PRESET_MODELS);
+                        imported.models = imported.models.filter((m) => m && typeof m === 'object');
+                        recomputeAllCosts(imported);
                         saveSettingsDebounced(); updateDashboard();
                         alert(safeT('导入成功'));
                     } else {
@@ -2467,7 +2521,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.3.0';
+const TF_VERSION = '2.4.0';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
@@ -2571,6 +2625,16 @@ function tfDiagnostics() {
     };
 }
 
+// 把不可信字符串插进 innerHTML 之前先转义
+function tfEscapeHtml(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function tfCopy(text, okMessage) {
     try {
         if (navigator.clipboard?.writeText) {
@@ -2604,9 +2668,11 @@ function priceHasValue(price) {
 function collectUnpricedModels(s) {
     const out = [];
     const seen = new Set();
-    for (const bucketName of ['stats', 'session']) {
-        const models = s?.[bucketName]?.models || {};
-        for (const [key, m] of Object.entries(models)) {
+    const sources = [s?.['stats']?.models, s?.['session']?.models];
+    // 历史也要扫：旧版只看 stats/session，历史里的未定价模型永远不会被提示
+    if (Array.isArray(s?.history)) for (const rec of s.history) if (rec && rec.models) sources.push(rec.models);
+    for (const models of sources) {
+        for (const [key, m] of Object.entries(models || {})) {
             if (!m || seen.has(key)) continue;
             if (priceHasValue(getPriceFor(s, key))) continue;
             seen.add(key);
@@ -2642,6 +2708,13 @@ function recomputeBucketCost(s, models) {
     let total = 0;
     for (const [key, m] of Object.entries(models || {})) {
         if (!m) continue;
+        const price = getPriceFor(s, key);
+        if (!price || price.matchedBy === 'none') {
+            // 没有可用价格时保留原值：旧版会把它重算成 0，
+            // 于是删掉一条价格就能让历史成本静默归零
+            total += m.cost || 0;
+            continue;
+        }
         const cost = calcCost(s, key, m.in || 0, m.out || 0, m.cached || 0, m.req || 0);
         m.cost = cost.usd;
         total += cost.usd;
@@ -2785,27 +2858,34 @@ try {
 } catch { /* ignore */ }
 
 /* ============================================================
- *  v2.2.0 · 范围化用量统计面板
+ *  v2.4.0 · 范围化用量统计面板
  *  对齐 DeepSeek 开放平台 / New API 的视图：
- *    · 时间范围：今天 / 近 7 天 / 近 30 天 / 全部
+ *    · 时间范围：预设（今天 / 近 7 天 / 本周 / 近 30 天 / 本月 / 全部）
+ *      + 自定义起止日期（点范围条展开，原生 date 输入，平板上直接弹系统日历）
  *    · 日柱图按「连续日期」铺满，缺日补 0
- *      （旧版是 slice(-14) 后按数组下标画，有缺日时整条横轴会错位）
  *    · 点选某天 → 下方固定显示当天按模型明细（平板上没有 hover）
  *    · 模型明细：费用 / 占比 / token / 输入 / 输出 / 缓存 / 命中率 / 请求数
  *    · 分组维度：按模型 / 按厂商
+ *
+ *  v2.4.0 起「范围」是唯一事实来源：图表与明细表共用同一个范围。
  * ============================================================ */
 
-const TF_RANGES = [
-    { id: 'today', label: '今天', days: 1 },
-    { id: '7d', label: '近 7 天', days: 7 },
-    { id: '30d', label: '近 30 天', days: 30 },
-    { id: 'all', label: '全部', days: 0 },
-];
-const TF_CHART_MAX_DAYS = 60;
+const TF_CHART_MAX_DAYS = 60;       // 柱子最多画这么多天，超出的部分只在合计里体现
 const TF_CHART_LABELS = 6;          // 横轴最多显示几个日期刻度
 const TF_TABLE_ROWS = 30;
 
-let tfRangeId = '7d';
+const TF_PRESETS = [
+    { id: 'today', label: '今天' },
+    { id: '7d', label: '近 7 天' },
+    { id: 'week', label: '本周' },
+    { id: '30d', label: '近 30 天' },
+    { id: 'month', label: '本月' },
+    { id: 'all', label: '全部' },
+];
+
+let tfRange = { mode: 'preset', id: '7d', from: '', to: '' };
+let tfRangeLoaded = false;
+let tfPickerOpen = false;
 let tfGroupMode = 'model';
 let tfSelectedDay = null;
 const tfUnpricedWarned = new Set();
@@ -2888,39 +2968,83 @@ function tfNotifyUnpricedModel(model, s) {
 }
 
 /* ============================================================
- *  范围聚合
+ *  日期工具（全部按本地时区，和 _todayStr 保持一致）
  * ============================================================ */
 
-function tfRangeDays(rangeId) {
-    const found = TF_RANGES.find((r) => r.id === rangeId);
-    return found ? found.days : 7;
+function tfTodayDate() {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
 }
 
-/** 连续日期轴（含今天）。缺日不会被跳过，柱子不会错位。 */
-function tfDateAxis(rangeId, history) {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    let span = tfRangeDays(rangeId);
-
-    if (rangeId === 'all') {
-        const dates = (Array.isArray(history) ? history : [])
-            .map((h) => (h && h.date) || '')
-            .filter(Boolean)
-            .sort();
-        if (!dates.length) return [_todayStr(today)];
-        const first = new Date(dates[0] + 'T00:00:00');
-        span = Math.round((today.getTime() - first.getTime()) / 86400000) + 1;
-    }
-    span = Math.max(1, Math.min(span, TF_CHART_MAX_DAYS));
-
-    const out = [];
-    for (let i = span - 1; i >= 0; i--) {
-        const d = new Date(today);
-        d.setDate(d.getDate() - i);
-        out.push(_todayStr(d));
-    }
-    return out;
+function tfParseDay(str) {
+    const parts = String(str || '').split('-').map((x) => parseInt(x, 10));
+    if (parts.length < 3 || !parts[0] || !parts[1] || !parts[2]) return tfTodayDate();
+    return new Date(parts[0], parts[1] - 1, parts[2]);
 }
+
+function tfDayOf(date) {
+    return _todayStr(date);
+}
+
+function tfAddDays(date, n) {
+    const d = new Date(date);
+    d.setDate(d.getDate() + n);
+    return d;
+}
+
+/** 把当前范围解析成 [from, to] 两个本地零点日期 */
+function tfRangeBounds(s, range) {
+    const today = tfTodayDate();
+
+    if (range && range.mode === 'custom' && range.from) {
+        const from = tfParseDay(range.from);
+        const to = range.to ? tfParseDay(range.to) : today;
+        return from.getTime() <= to.getTime() ? { from, to } : { from: to, to: from };
+    }
+
+    switch (range && range.id) {
+        case 'today':
+            return { from: today, to: today };
+        case 'week': {
+            const offset = (today.getDay() + 6) % 7;   // 周一为一周之始
+            return { from: tfAddDays(today, -offset), to: today };
+        }
+        case '30d':
+            return { from: tfAddDays(today, -29), to: today };
+        case 'month':
+            return { from: new Date(today.getFullYear(), today.getMonth(), 1), to: today };
+        case 'all': {
+            const dates = (Array.isArray(s && s.history) ? s.history : [])
+                .map((h) => (h && h.date) || '')
+                .filter(Boolean)
+                .sort();
+            return { from: dates.length ? tfParseDay(dates[0]) : today, to: today };
+        }
+        case '7d':
+        default:
+            return { from: tfAddDays(today, -6), to: today };
+    }
+}
+
+/**
+ * 图表用的连续日期轴。
+ * 只有「画柱子」被限制在 TF_CHART_MAX_DAYS 天内，
+ * 合计与明细表仍然覆盖完整范围（clamped=true 时界面会说明）。
+ */
+function tfChartAxis(bounds) {
+    const span = Math.round((bounds.to.getTime() - bounds.from.getTime()) / 86400000) + 1;
+    const clamped = span > TF_CHART_MAX_DAYS;
+    const start = clamped ? tfAddDays(bounds.to, -(TF_CHART_MAX_DAYS - 1)) : bounds.from;
+    const count = clamped ? TF_CHART_MAX_DAYS : Math.max(1, span);
+    const axis = [];
+    for (let i = 0; i < count; i++) axis.push(tfDayOf(tfAddDays(start, i)));
+    return { axis, clamped };
+}
+
+/* ============================================================
+ *  范围聚合
+ * ============================================================ */
 
 function tfNewBucket() {
     return { in: 0, out: 0, cached: 0, req: 0, cost: 0, est: 0, unpriced: 0, rawNames: {} };
@@ -2939,16 +3063,18 @@ function tfAccumulate(bucket, src, rawName) {
 }
 
 /**
- * 聚合一个范围。
+ * 聚合当前范围。
  *   今天     —— 用实时 dailyStats（它是滚动的）
- *   近 N 天  —— 逐日累加 history 里的按模型用量
+ *   其余日子 —— 逐日累加 history 里的按模型用量
  *   全部     —— 直接用 stats.models（全量最准），图表仍用 history
- * 没有「按模型用量」的老历史条目（v2.1 之前）会被计入总计，
- * 但无法归到具体模型，会计入 legacyDays 并在界面上说明。
+ * 没有「按模型用量」的老历史条目会被计入总计但无法归到具体模型，
+ * 计进 legacyDays 并在界面上说明。
  */
-function tfAggregateRange(s, rangeId) {
-    const axis = tfDateAxis(rangeId, s.history);
-    const axisSet = new Set(axis);
+function tfAggregateRange(s, range) {
+    const bounds = tfRangeBounds(s, range);
+    const chart = tfChartAxis(bounds);
+    const fromKey = tfDayOf(bounds.from);
+    const toKey = tfDayOf(bounds.to);
     const dayMap = new Map();
     const byModel = new Map();
     const byProvider = new Map();
@@ -2977,21 +3103,25 @@ function tfAggregateRange(s, rangeId) {
         tfAccumulate(byProvider.get(provider), entry, name);
     };
 
-    if (rangeId === 'all') {
+    if (range && range.mode === 'preset' && range.id === 'all') {
         for (const [name, entry] of Object.entries(s.stats.models || {})) addModel(name, entry);
         for (const rec of (s.history || [])) {
             if (rec && rec.date) dayMap.set(rec.date, rec);
         }
     } else {
+        const inRange = (date) => date >= fromKey && date <= toKey;
         for (const rec of (s.history || [])) {
-            if (!rec || !rec.date || !axisSet.has(rec.date)) continue;
+            if (!rec || !rec.date || !inRange(rec.date)) continue;
             dayMap.set(rec.date, rec);
         }
+        // 今天以实时 dailyStats 为准（history 里那条是归档快照）
         const live = tfTodayStats(s);
-        if (live && live.date && axisSet.has(live.date)) {
+        if (live && live.date && inRange(live.date)) {
             dayMap.set(live.date, {
-                date: live.date, cost: live.cost || 0,
-                tokens: live.tokens || 0, req: live.req || 0,
+                date: live.date,
+                cost: live.cost || 0,
+                tokens: live.tokens || 0,
+                req: live.req || 0,
                 models: live.models || {},
             });
         }
@@ -3011,17 +3141,23 @@ function tfAggregateRange(s, rangeId) {
         }
     }
 
-    const days = axis.map((date) => {
+    const days = chart.axis.map((date) => {
         const rec = dayMap.get(date);
-        const models = (rec && rec.models) || {};
-        const cost = rec ? (rec.cost || 0) : 0;
-        const tokens = rec ? (rec.tokens || 0) : 0;
-        return { date, cost, tokens, req: (rec && rec.req) || 0, models };
+        return {
+            date,
+            cost: rec ? (rec.cost || 0) : 0,
+            tokens: rec ? (rec.tokens || 0) : 0,
+            req: (rec && rec.req) || 0,
+            models: (rec && rec.models) || {},
+        };
     });
 
     return {
-        rangeId,
-        axis,
+        rangeId: (range && range.mode === 'custom') ? 'custom' : ((range && range.id) || '7d'),
+        axis: chart.axis,
+        clamped: chart.clamped,
+        from: fromKey,
+        to: toKey,
         days,
         summary,
         models: [...byModel.values()],
@@ -3065,28 +3201,156 @@ function tfChip(label, active, onClick) {
     return btn;
 }
 
-function tfRenderRangeSwitcher(container, s) {
+function tfSaveRange(s) {
+    s.statsRange = { mode: tfRange.mode, id: tfRange.id, from: tfRange.from, to: tfRange.to };
+    saveSettingsDebounced();
+}
+
+function tfApplyCustom(s, from, to) {
+    const bounds = tfRangeBounds(s, tfRange);
+    tfRange = {
+        mode: 'custom',
+        id: 'custom',
+        from: from || tfDayOf(bounds.from),
+        to: to || tfDayOf(bounds.to),
+    };
+    tfSelectedDay = null;
+    tfSaveRange(s);
+    safeUpdateUI();
+}
+
+function tfRenderRangePicker(container, s) {
+    const bounds = tfRangeBounds(s, tfRange);
+
+    // 第一排：预设 + 分组维度
     const row = document.createElement('div');
     row.className = 'tf-range-row';
 
-    const ranges = document.createElement('div');
-    ranges.className = 'tf-range-group';
-    for (const range of TF_RANGES) {
-        ranges.appendChild(tfChip(safeT(range.label), tfRangeId === range.id, () => {
-            tfRangeId = range.id;
+    const presets = document.createElement('div');
+    presets.className = 'tf-range-group';
+    for (const preset of TF_PRESETS) {
+        const active = tfRange.mode === 'preset' && tfRange.id === preset.id;
+        presets.appendChild(tfChip(safeT(preset.label), active, () => {
+            tfRange = { mode: 'preset', id: preset.id, from: '', to: '' };
+            tfPickerOpen = false;
             tfSelectedDay = null;
+            tfSaveRange(s);
             safeUpdateUI();
         }));
     }
-    row.appendChild(ranges);
+    row.appendChild(presets);
 
     const groups = document.createElement('div');
     groups.className = 'tf-range-group';
     groups.appendChild(tfChip(safeT('按模型'), tfGroupMode === 'model', () => { tfGroupMode = 'model'; safeUpdateUI(); }));
     groups.appendChild(tfChip(safeT('按厂商'), tfGroupMode === 'provider', () => { tfGroupMode = 'provider'; safeUpdateUI(); }));
     row.appendChild(groups);
-
     container.appendChild(row);
+
+    // 第二排：范围条（点开选起止日期）
+    const bar = document.createElement('button');
+    bar.type = 'button';
+    bar.className = 'tf-range-bar'
+        + (tfPickerOpen ? ' open' : '')
+        + (tfRange.mode === 'custom' ? ' is-custom' : '');
+    bar.title = safeT('点这里选起止日期');
+
+    const barIcon = document.createElement('span');
+    barIcon.className = 'tf-range-bar-icon';
+    barIcon.textContent = '📅';
+
+    const barText = document.createElement('span');
+    barText.className = 'tf-range-bar-text';
+    barText.textContent = tfDayOf(bounds.from) + ' 00:00 ~ ' + tfDayOf(bounds.to) + ' 23:00';
+
+    bar.appendChild(barIcon);
+    bar.appendChild(barText);
+    if (tfRange.mode === 'custom') {
+        const tag = document.createElement('span');
+        tag.className = 'tf-range-bar-tag';
+        tag.textContent = safeT('自定义');
+        bar.appendChild(tag);
+    }
+    const caret = document.createElement('span');
+    caret.className = 'tf-range-bar-caret';
+    caret.textContent = tfPickerOpen ? '▲' : '▼';
+    bar.appendChild(caret);
+
+    bar.addEventListener('click', () => {
+        tfPickerOpen = !tfPickerOpen;
+        safeUpdateUI();
+    });
+    container.appendChild(bar);
+
+    if (tfPickerOpen) container.appendChild(tfBuildRangeEditor(s, bounds));
+}
+
+function tfBuildRangeEditor(s, bounds) {
+    const box = document.createElement('div');
+    box.className = 'tf-range-editor';
+
+    // 起始 / 结束：用原生 date 输入，平板上点一下就是系统日历，触控友好且不会写错
+    const fields = document.createElement('div');
+    fields.className = 'tf-range-fields';
+
+    const makeField = (label, value, onPick) => {
+        const wrap = document.createElement('label');
+        wrap.className = 'tf-range-field';
+        const cap = document.createElement('span');
+        cap.className = 'tf-range-field-cap';
+        cap.textContent = label;
+        const input = document.createElement('input');
+        input.type = 'date';
+        input.className = 'tf-range-date';
+        input.value = value;
+        input.addEventListener('change', () => onPick(input.value));
+        wrap.appendChild(cap);
+        wrap.appendChild(input);
+        return wrap;
+    };
+
+    fields.appendChild(makeField(safeT('起始时间'), tfDayOf(bounds.from), (v) => tfApplyCustom(s, v, null)));
+
+    const sep = document.createElement('span');
+    sep.className = 'tf-range-sep';
+    sep.textContent = '~';
+    fields.appendChild(sep);
+
+    fields.appendChild(makeField(safeT('结束时间'), tfDayOf(bounds.to), (v) => tfApplyCustom(s, null, v)));
+    box.appendChild(fields);
+
+    // 快捷：和上面那排预设一致，点了立刻生效
+    const quick = document.createElement('div');
+    quick.className = 'tf-range-quick';
+    const todayKey = tfDayOf(tfTodayDate());
+    for (const preset of TF_PRESETS) {
+        if (preset.id === 'all') continue;
+        const picked = tfRangeBounds(s, { mode: 'preset', id: preset.id });
+        const active = tfRange.mode === 'custom'
+            && tfDayOf(picked.from) === tfDayOf(bounds.from)
+            && tfDayOf(picked.to) === tfDayOf(bounds.to);
+        quick.appendChild(tfChip(safeT(preset.label), active, () => {
+            tfRange = { mode: 'custom', id: preset.id, from: tfDayOf(picked.from), to: tfDayOf(picked.to) };
+            tfSelectedDay = null;
+            tfSaveRange(s);
+            safeUpdateUI();
+        }));
+    }
+    box.appendChild(quick);
+
+    const actions = document.createElement('div');
+    actions.className = 'tf-range-actions';
+    actions.appendChild(tfButton(safeT('今天'), () => tfApplyCustom(s, todayKey, todayKey), 'tf-diag-btn'));
+    actions.appendChild(tfButton(safeT('清除'), () => {
+        tfRange = { mode: 'preset', id: '7d', from: '', to: '' };
+        tfPickerOpen = false;
+        tfSelectedDay = null;
+        tfSaveRange(s);
+        safeUpdateUI();
+    }, 'tf-diag-btn'));
+    box.appendChild(actions);
+
+    return box;
 }
 
 function tfRenderSummary(container, s, stats) {
@@ -3100,8 +3364,7 @@ function tfRenderSummary(container, s, stats) {
     money.textContent = fmtMoney(s, stats.summary.cost || 0);
     const meta = document.createElement('div');
     meta.className = 'tf-summary-meta';
-    const groupCount = tfGroupList(stats).length;
-    meta.textContent = groupCount + ' ' + safeT('个分组') + ' · ' + (stats.summary.req || 0) + ' ' + safeT('次请求');
+    meta.textContent = tfGroupList(stats).length + ' ' + safeT('个分组') + ' · ' + (stats.summary.req || 0) + ' ' + safeT('次请求');
     head.appendChild(money);
     head.appendChild(meta);
     box.appendChild(head);
@@ -3152,9 +3415,9 @@ function tfRenderChart(container, s, stats) {
 
     const title = document.createElement('div');
     title.className = 'tf-model-title';
-    // 「全部」时图表只画得下 TF_CHART_MAX_DAYS 天，必须说明，
-    // 否则用户会以为这里和上面的累计总额对不上是算错了
-    const clampedNote = (stats.rangeId === 'all' && stats.axis.length >= TF_CHART_MAX_DAYS)
+    // 范围很长时柱子只画得下 TF_CHART_MAX_DAYS 天，必须说明，
+    // 否则用户会以为图表和上面的合计对不上是算错了
+    const clampedNote = stats.clamped
         ? ' · ' + safeT('图表最多显示 {n} 天').replace('{n}', String(TF_CHART_MAX_DAYS))
         : '';
     title.textContent = '📈 ' + safeT('每日消费') + clampedNote + ' · ' + safeT('点柱子看当天明细');
@@ -3222,17 +3485,30 @@ function tfRenderDayDetail(container, s, stats) {
     }
     entries.sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0));
     for (const [name, entry] of entries) {
-        const row = document.createElement('div');
-        row.className = 'tf-day-detail-row';
+        const item = document.createElement('div');
+        item.className = 'tf-day-detail-item';
+
+        const line = document.createElement('div');
+        line.className = 'tf-day-detail-row';
         const n = document.createElement('span');
         n.className = 'tf-day-detail-name';
         n.textContent = name;
         const v = document.createElement('span');
         v.className = 'tf-day-detail-val';
         v.textContent = fmtMoney(s, entry.cost || 0) + ' · ' + fmtTokens(tfTotalTokens(entry));
-        row.appendChild(n);
-        row.appendChild(v);
-        box.appendChild(row);
+        line.appendChild(n);
+        line.appendChild(v);
+        item.appendChild(line);
+
+        // 第二行：和下面明细表同一个口径，省得两处对不上
+        const breakdown = document.createElement('div');
+        breakdown.className = 'tf-day-detail-breakdown';
+        breakdown.textContent = safeT('输入') + ' ' + fmtTokens(entry.in || 0)
+            + ' · ' + safeT('输出') + ' ' + fmtTokens(entry.out || 0)
+            + ' · ' + safeT('缓存命中') + ' ' + fmtTokens(entry.cached || 0);
+        item.appendChild(breakdown);
+
+        box.appendChild(item);
     }
 
     container.appendChild(box);
@@ -3351,9 +3627,17 @@ function tfRenderGroupTable(container, s, stats) {
 }
 
 function renderStatsPanel(container, s) {
+    if (!tfRangeLoaded) {
+        tfRangeLoaded = true;
+        const saved = s && s.statsRange;
+        if (saved && typeof saved === 'object' && saved.mode) {
+            tfRange = { mode: saved.mode, id: saved.id || '7d', from: saved.from || '', to: saved.to || '' };
+        }
+    }
+
     let stats = null;
     try {
-        stats = tfAggregateRange(s, tfRangeId);
+        stats = tfAggregateRange(s, tfRange);
     } catch (error) {
         // 不能直接 return 留一块空白：给一条看得见的提示，细节在运行日志里
         tfLog('error', 'stats.aggregate', '统计聚合失败: ' + (error?.message || error));
@@ -3363,7 +3647,8 @@ function renderStatsPanel(container, s) {
         container.appendChild(box);
         return;
     }
-    tfRenderRangeSwitcher(container, s);
+
+    tfRenderRangePicker(container, s);
     tfRenderSummary(container, s, stats);
     tfRenderChart(container, s, stats);
     tfRenderDayDetail(container, s, stats);

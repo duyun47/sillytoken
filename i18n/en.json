@@ -195,5 +195,12 @@
   "其中 {n} 次为本地估算": "{n} of them are local estimates",
   "图表最多显示 {n} 天": "chart shows at most {n} days",
   "统计渲染失败，详情见下方运行日志": "Stats failed to render; see the runtime log below",
+  "本周": "This week",
+  "本月": "This month",
+  "起始时间": "Start",
+  "结束时间": "End",
+  "清除": "Clear",
+  "自定义": "Custom",
+  "点这里选起止日期": "Pick a start and end date",
   "有 {n} 天的旧记录没有按模型明细，只计入总计": "{n} older days have no per-model detail and are counted in totals only"
 }
