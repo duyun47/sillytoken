@@ -1558,6 +1558,27 @@ function updateDashboard() {
     el.innerHTML = '';
     el.appendChild(grid);
 
+    // 渲染后自检：真机上出现过「概览 6 张卡占着位置、却整块没画出来」，
+    // 而用户设备上没有 DevTools —— 面板变空只能靠猜。这里把现场写进运行日志
+    // （面板底部就能看到、也能复制出来），下次一出问题就有证据可查。
+    if (s.enabled && el && typeof el.querySelectorAll === 'function') {
+        let cardCount = -1;
+        try { cardCount = el.querySelectorAll('.tf-stat-card').length; } catch { cardCount = -1; }
+        if (cardCount >= 0 && cardCount < 6) {
+            let theme = 'none';
+            try {
+                const panelEl = document.getElementById('token_flow_panel');
+                theme = (panelEl && panelEl.getAttribute && panelEl.getAttribute('data-tf-theme')) || 'none';
+            } catch { theme = 'none'; }
+            tfLog('error', 'ui.blank', '概览卡片没渲染完整（' + cardCount + '/6）—— 面板可能看起来是空的', {
+                container: el.id || '(no id)',
+                children: el.childElementCount,
+                viewport: (window.innerWidth || 0) + 'x' + (window.innerHeight || 0),
+                theme,
+            });
+        }
+    }
+
     // ============ v1.3.0：Gemini 风格用量限额面板 ============
     renderGeminiQuota(el, s);
 
@@ -2682,7 +2703,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.6.0';
+const TF_VERSION = '2.6.1';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;

@@ -109,13 +109,13 @@
 }
 
 .tf-stat-card {
+    /* v2.6.1：不再用 backdrop-filter（详见本节注释），背景走扩展自己的主题变量 */
     background: linear-gradient(135deg,
-        color-mix(in srgb, var(--SmartThemeBlurTintColor, #2c3e50) 85%, transparent),
-        color-mix(in srgb, var(--SmartThemeBlurTintColor, #1a252f) 55%, transparent));
+        var(--tf-surface-2, rgba(128, 128, 128, 0.10)),
+        var(--tf-surface, rgba(128, 128, 128, 0.18)));
     border: 1px solid var(--tf-border, var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.25)));
     border-radius: 14px;
     padding: 14px 16px;
-    backdrop-filter: blur(10px);
     box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
     transition: transform 0.15s ease, box-shadow 0.15s ease;
 }
@@ -458,6 +458,7 @@
     z-index: 2147483000;
     inset: 0;
     background: rgba(0, 0, 0, 0.45);
+    -webkit-backdrop-filter: blur(2px);
     backdrop-filter: blur(2px);
 }
 
