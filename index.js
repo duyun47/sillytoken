@@ -715,6 +715,106 @@ function getCapturePatchState(win) {
 
 /* ---------- 载荷归一化（fetch / XHR / 宿主函数统一成 messages） ---------- */
 
+/**
+ * 从响应体里抠出「模型这次到底产出了什么文字」。
+ * 旧版非流式路径没做这件事，于是没有 usage 时输出恒按 0 估 —— 回复几千字也只算输入。
+ */
+function extractOutputTextFromBody(body) {
+    if (!body || typeof body !== 'object') return '';
+    const choice = (Array.isArray(body.choices) && body.choices[0])
+        || (Array.isArray(body.completions) && body.completions[0])
+        || null;
+    if (choice) {
+        const raw = choice.message ? choice.message.content
+            : (choice.text != null ? choice.text
+                : (choice.delta ? choice.delta.content : ''));
+        const text = contentToText(raw);
+        if (text) return text;
+        // 工具调用：正文为空但参数就是模型的输出，照样要算进输出 token
+        const calls = choice.message && choice.message.tool_calls;
+        if (Array.isArray(calls) && calls.length) {
+            try { return JSON.stringify(calls); } catch { /* ignore */ }
+        }
+    }
+    // Anthropic 原生：{ content: [{ type: 'text', text: '...' }] }
+    const anth = contentToText(body.content);
+    if (anth) return anth;
+    // Gemini 原生：{ candidates: [{ content: { parts: [...] } }] }
+    const cand = Array.isArray(body.candidates) && body.candidates[0];
+    if (cand && cand.content) {
+        const gem = contentToText(cand.content.parts);
+        if (gem) return gem;
+    }
+    return '';
+}
+
+/**
+ * 响应里带没带错误。
+ *
+ * 中转商（New API / one-api 这类）报错时最典型的两种回法：
+ *   · HTTP 200 + {"error": {"message": "..."}} —— JSON 层错误
+ *   · HTTP 200 + 一页 HTML 错误页 —— 连 JSON 都不是
+ * 两者过去都会被当成"成功但没 usage"，然后被估算记成一笔真实消费。
+ */
+function extractErrorTextFromBody(body) {
+    if (!body || typeof body !== 'object') return '';
+    const err = body.error || body.errors
+        || (body.data && typeof body.data === 'object' ? body.data.error : null);
+    if (!err) {
+        if (String(body.type || '').toLowerCase() === 'error') {
+            return String(body.message || 'error').slice(0, 120);
+        }
+        return '';
+    }
+    // 空的 errors 数组 / error: null 不算错误
+    if (Array.isArray(err)) {
+        if (!err.length) return '';
+        return String(err[0]?.message || err[0] || 'error').slice(0, 120);
+    }
+    if (typeof err === 'string') return err.slice(0, 120);
+    if (typeof err === 'object') {
+        const msg = err.message || err.msg || err.type || err.code;
+        if (msg != null) return String(msg).slice(0, 120);
+        try { return JSON.stringify(err).slice(0, 120); } catch { return 'error'; }
+    }
+    return String(err).slice(0, 120);
+}
+
+/**
+ * 这个响应体看起来像一次「模型真的回复了」的完成响应吗？
+ *
+ * 用形状判断，而不是判断"有没有文字" —— 工具调用（tool_calls）的回复正文是空的，
+ * 但那确实是一次成功且计费的生成，不能因为抠不出文字就当它没发生。
+ */
+function hasCompletionShape(body) {
+    if (!body || typeof body !== 'object') return false;
+    if (Array.isArray(body.choices) && body.choices.length) return true;
+    if (Array.isArray(body.completions) && body.completions.length) return true;
+    if (Array.isArray(body.candidates) && body.candidates.length) return true;
+    // Anthropic 原生：{ content: [{...}] }。空数组不算 —— 那是"什么都没产出"，
+    // 不能因为 object 字段写着 chat.completion 就当它成功（实测中转商会这么回）
+    if (Array.isArray(body.content)) return body.content.length > 0;
+    if (body.content != null) return true;
+    return false;
+}
+
+/** 宿主函数（generateRaw）把错误当正常返回值给回来时，别把它算成一次生成 */
+function isHostErrorPayload(value) {
+    if (typeof value === 'string') {
+        const s = value.trim();
+        if (!s.startsWith('{')) return false;
+        try {
+            const json = JSON.parse(s);
+            return !!extractErrorTextFromBody(json);
+        } catch { return false; }
+    }
+    if (value && typeof value === 'object') {
+        if (value.ok === false) return true;
+        return !!extractErrorTextFromBody(value);
+    }
+    return false;
+}
+
 function contentToText(content) {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
@@ -924,19 +1024,63 @@ function finishCapture(capture, options = {}) {
 
 /* ---------- 响应解析 ---------- */
 
+function tryParseJson(text) {
+    try {
+        const json = JSON.parse(text);
+        return (json && typeof json === 'object') ? json : null;
+    } catch { return null; }
+}
+
+/**
+ * 拿到「非流式响应体」之后的统一判账，fetch / XHR / 流式回退三处共用一份。
+ *
+ * 顺序很重要：usage > 错误 > 正文/形状 > 不估。
+ * 旧版少了中间两步，于是 200 + {"error":...} 这种中转商标准报错会被当成
+ * "成功但没 usage"，然后估算记成一笔真实消费 —— 用户反馈的"报错也算进去了"。
+ */
+function finishFromBody(capture, json, layer) {
+    if (json && typeof json.model === 'string' && json.model) capture.model = json.model;
+
+    const usage = extractUsageFromBody(json);
+    if (usage) { finishCapture(capture, { usage }); return; }
+
+    const err = extractErrorTextFromBody(json);
+    if (err) { finishCapture(capture, { reason: layer + '里返回了错误: ' + err, estimate: false }); return; }
+
+    const outputText = extractOutputTextFromBody(json);
+    // 既不是完成响应、又抠不出正文 → 这次请求没产出东西，不能凭空估算
+    if (!outputText && !hasCompletionShape(json)) {
+        const hint = [json && json.message, json && json.msg, json && json.detail, json && json.code]
+            .filter((v) => v != null && v !== '').join(' / ').slice(0, 120);
+        finishCapture(capture, {
+            reason: layer + '里既没有 usage 也没有正文' + (hint ? '（' + hint + '）' : ''),
+            estimate: false,
+        });
+        return;
+    }
+
+    // 有正文：交下去估输出。旧版没传 outputText，输出恒按 0 算
+    finishCapture(capture, { outputText, reason: layer + '里没有 usage 字段' });
+}
+
 async function trackStreamResponse(response, capture) {
     let text = '';
+    let raw = '';        // 原始文本：有的中转声明了 stream 却直接回 JSON
     try {
         const reader = response.clone().body.getReader();
         const decoder = new TextDecoder('utf-8');
         let buffer = '';
         let usage = null;
         let sawDone = false;
+        let sawSse = false;
+        let errorText = '';
 
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
-            buffer += decoder.decode(value, { stream: true });
+            const piece = decoder.decode(value, { stream: true });
+            raw += piece;
+            buffer += piece;
 
             const parts = buffer.split(/\r?\n\r?\n/);   // 兼容 CRLF 分隔的 SSE
             buffer = parts.pop();
@@ -945,21 +1089,60 @@ async function trackStreamResponse(response, capture) {
                 if (sawDone) continue;
                 const line = chunk.split(/\r?\n/).find((l) => l.startsWith('data:'));
                 if (!line) continue;
+                sawSse = true;
                 const data = line.slice(5).trim();
                 if (!data) continue;
                 if (data === STREAM_DONE) { sawDone = true; break; }
                 try {
                     const json = JSON.parse(data);
+                    // 假流式中转出错时也是 200 + SSE，只是 data 里装的是 error
+                    const err = extractErrorTextFromBody(json);
+                    if (err) errorText = err;
                     const found = extractUsageFromBody(json);
                     if (found) usage = found;
                     if (json.model) capture.model = json.model;
-                    const piece = json.choices?.[0]?.delta?.content || json.choices?.[0]?.text || '';
-                    if (typeof piece === 'string') text += piece;
+                    const piece2 = json.choices?.[0]?.delta?.content || json.choices?.[0]?.text || '';
+                    if (typeof piece2 === 'string') text += piece2;
+                    // 工具调用的参数是分片流过来的，正文为空但它就是这次的输出
+                    const calls = json.choices?.[0]?.delta?.tool_calls;
+                    if (Array.isArray(calls)) {
+                        for (const c of calls) {
+                            const arg = c && c.function && c.function.arguments;
+                            if (typeof arg === 'string') text += arg;
+                        }
+                    }
                 } catch { /* 片段 JSON，跳过 */ }
             }
         }
 
-        finishCapture(capture, usage ? { usage } : { outputText: text, reason: '流式结束但没收到 usage chunk' });
+        if (usage) {
+            finishCapture(capture, { usage });
+            return;
+        }
+        if (errorText) {
+            // 有正文也照样不算：这次请求是失败的，宁可记「未捕获」也不编一笔消费
+            finishCapture(capture, {
+                reason: '流里返回了错误: ' + errorText + (text ? '（已产出 ' + text.length + ' 字，未计入）' : ''),
+                estimate: false,
+            });
+            return;
+        }
+        if (text) {
+            finishCapture(capture, { outputText: text, reason: '流式结束但没收到 usage chunk' });
+            return;
+        }
+        // 完全没看到 SSE 帧：多半是"声明了 stream，服务器却直接回了 JSON"
+        if (!sawSse) {
+            const json = tryParseJson(raw);
+            if (json) { finishFromBody(capture, json, '响应'); return; }
+        }
+        if (sawDone) {
+            // 正常收到 [DONE]（例如纯工具调用、正文为空）：输入确实发出去了，可以估
+            finishCapture(capture, { outputText: '', reason: '流式正常结束但没有正文' });
+            return;
+        }
+        // 没有 usage、没有正文、也没有 [DONE]：这次生成没产出任何东西，不能凭空估算
+        finishCapture(capture, { reason: '流式连接中断且没有正文', estimate: false });
     } catch (error) {
         finishCapture(capture, { reason: '流读取失败: ' + (error?.message || error), estimate: false });
     }
@@ -979,12 +1162,13 @@ function trackResponse(response, capture) {
             return;
         }
         response.clone().json().then((json) => {
-            const usage = extractUsageFromBody(json);
-            if (json && typeof json.model === 'string' && json.model) capture.model = json.model;
-            finishCapture(capture, usage ? { usage } : { reason: '响应里没有 usage 字段' });
-        }).catch(() => finishCapture(capture, { reason: '响应不是 JSON' }));
+            finishFromBody(capture, json, '响应');
+        }).catch(() => {
+            // 连 JSON 都不是（HTML 错误页 / 空 body）→ 不知道成功与否，不能估算
+            finishCapture(capture, { reason: '响应不是 JSON', estimate: false });
+        });
     } catch (error) {
-        finishCapture(capture, { reason: '响应解析异常: ' + (error?.message || error) });
+        finishCapture(capture, { reason: '响应解析异常: ' + (error?.message || error), estimate: false });
     }
 }
 
@@ -1139,15 +1323,13 @@ function patchXhrOnWindow(win, state) {
                 const capture = acquireCapture(payload, requestUrl, win, false);
                 xhr.addEventListener('loadend', () => {
                     if (xhr.status >= 200 && xhr.status < 400) {
-                        let json = null;
-                        try { json = JSON.parse(xhr.responseText || ''); } catch { json = null; }
+                        const json = tryParseJson(xhr.responseText || '');
                         if (!json) {
-                            finishCapture(capture, { reason: 'XHR 响应不是 JSON' });
+                            // 不是 JSON（HTML 错误页 / 空 body）→ 不知道成功与否，不能估算
+                            finishCapture(capture, { reason: 'XHR 响应不是 JSON', estimate: false });
                             return;
                         }
-                        const usage = extractUsageFromBody(json);
-                        if (json.model) capture.model = json.model;
-                        finishCapture(capture, usage ? { usage } : { reason: 'XHR 响应里没有 usage 字段' });
+                        finishFromBody(capture, json, 'XHR 响应');
                     } else {
                         finishCapture(capture, { reason: 'XHR 失败：HTTP ' + xhr.status, estimate: false });
                     }
@@ -1238,6 +1420,13 @@ function patchHostFunctionsOnWindow(win, state) {
         // 内层 fetch/XHR 已经把这条认领走并写好 usage 时，这里什么都不做
         const settle = (value) => {
             if (capture.claimed || capture.done) return;
+            // 有的宿主把错误当正常返回值（字符串 / {error}）给回来，
+            // 那不是一次生成，别把它估成一笔消费
+            if (isHostErrorPayload(value)) {
+                const err = typeof value === 'string' ? value.slice(0, 120) : extractErrorTextFromBody(value);
+                finishCapture(capture, { reason: '宿主函数返回了错误内容: ' + err, estimate: false });
+                return;
+            }
             finishCapture(capture, {
                 outputText: typeof value === 'string' ? value : '',
                 reason: '宿主函数调用未经过可见的网络层',
@@ -2747,7 +2936,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.7.0';
+const TF_VERSION = '2.7.1';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
