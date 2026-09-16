@@ -1668,3 +1668,14 @@
 .tf-range-sep { padding-bottom: 8px; opacity: 0.6; }
 .tf-range-quick { display: flex; gap: 4px; flex-wrap: wrap; }
 .tf-range-actions { display: flex; gap: 6px; }
+
+/* ============================================================
+ *  v2.6.0 · 窄屏（手机）悬浮球默认位置
+ *  避开酒馆底部输入栏与系统手势条；用户拖过球后由内联样式接管。
+ * ============================================================ */
+@media (max-width: 768px) {
+    .tf-orb {
+        right: 14px;
+        bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+    }
+}

@@ -1868,8 +1868,72 @@ function resetSessionStats() {
  * ============================================================ */
 
 const ORB_SIZE = 56;
+const ORB_MARGIN = 8;         // 球离屏幕边缘至少留这么多
+const ORB_SNAP_RANGE = 24;    // 松手时离边这么近才吸附，否则停在你放的位置
 let orbDragState = null;
 let orbSuppressClick = false;
+
+/** 球可以摆放的范围（视口减去球本身），至少 1 以免除零 */
+function orbMaxOffset(win) {
+    return {
+        x: Math.max(1, (win.innerWidth || 0) - ORB_SIZE),
+        y: Math.max(1, (win.innerHeight || 0) - ORB_SIZE),
+    };
+}
+
+const orbClamp01 = (v) => Math.min(1, Math.max(0, v));
+
+/**
+ * 读回悬浮球位置，返回当前屏幕上的像素坐标。
+ *
+ * 存的是占可用空间的比例（fx/fy ∈ 0~1），这样 PC 和手机各按自己的屏幕还原，
+ * 不会出现「电脑上拖到右边、手机上跑到屏幕外」。旧数据是像素 { x, y }：
+ * 用当前视口折算一次再夹到 0~1 —— 折算结果和旧版在同一屏幕上完全一致，
+ * 换到窄屏则被拉回边内（而不是丢在屏幕外）。
+ */
+function readOrbPosition(win) {
+    let stored = null;
+    try { stored = getSettings().orbPosition; } catch { return null; }
+    if (!stored || typeof stored !== 'object') return null;
+
+    const max = orbMaxOffset(win);
+    const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+
+    let fx = num(stored.fx);
+    if (fx === null) {
+        const legacyX = num(stored.x);
+        if (legacyX === null) return null;   // 脏数据：交回 CSS 默认位置
+        fx = legacyX / max.x;
+    }
+
+    let fy = num(stored.fy);
+    if (fy === null) {
+        const legacyY = num(stored.y);
+        fy = legacyY === null ? null : legacyY / max.y;
+    }
+
+    fx = orbClamp01(fx);
+    if (fy !== null) fy = orbClamp01(fy);
+    return { x: fx * max.x, y: fy === null ? null : fy * max.y };
+}
+
+function applyOrbPosition(win, orb, pos) {
+    if (!pos) return;
+    orb.style.left = Math.round(pos.x) + 'px';
+    orb.style.right = 'auto';
+    if (pos.y !== null) {
+        orb.style.top = Math.round(pos.y) + 'px';
+        orb.style.bottom = 'auto';
+    }
+}
+
+/** 松手后落盘：写比例，不写像素 */
+function saveOrbPosition(win, x, y) {
+    const max = orbMaxOffset(win);
+    const s = getSettings();
+    s.orbPosition = { fx: orbClamp01(x / max.x), fy: orbClamp01(y / max.y) };
+    saveSettingsDebounced();
+}
 
 function ensureFloatingUI() {
     if (document.getElementById('token_flow_orb')) return true;
@@ -1920,14 +1984,13 @@ function ensureFloatingUI() {
     const refreshBtn = document.getElementById('token_flow_manual_refresh') || document.getElementById('token_flow_refresh');
     const resetBtn = document.getElementById('token_flow_reset_session');
 
-    // 恢复悬浮球位置
-    const stored = getSettings().orbPosition;
-    if (stored && typeof stored.x === 'number') {
-        orb.style.left = stored.x + 'px';
-        orb.style.top = stored.y + 'px';
-        orb.style.right = 'auto';
-        orb.style.bottom = 'auto';
-    }
+    // 恢复悬浮球位置：比例 -> 当前屏幕像素，天然不会落到屏幕外
+    // （旧版直接写像素，从宽屏同步到手机时球会被画到屏幕外，真机上就是"消失"）
+    applyOrbPosition(window, orb, readOrbPosition(window));
+    // 横竖屏切换 / 手机地址栏收放都会改变 innerHeight，跟着重新摆一次
+    const reclampOrb = () => applyOrbPosition(window, orb, readOrbPosition(window));
+    window.addEventListener('resize', reclampOrb);
+    window.addEventListener('orientationchange', reclampOrb);
 
     // 拖动逻辑
     orb.addEventListener('pointerdown', (e) => {
@@ -1968,15 +2031,17 @@ function ensureFloatingUI() {
         orbDragState = null;
         if (drag.moved) {
             const rect = orb.getBoundingClientRect();
-            const centerX = rect.left + rect.width / 2;
-            const snapLeft = centerX < window.innerWidth / 2;
-            const margin = 12;
-            const snapX = snapLeft ? margin : window.innerWidth - ORB_SIZE - margin;
-            orb.style.left = snapX + 'px';
+            // 只有松手时贴着边（<=24px）才吸附，其余位置就停在你放的地方。
+            // 旧版无条件吸到左/右 12px，于是球永远只能在两条边上，用户反馈"没法自由移动"。
+            let x = rect.left;
+            if (x <= ORB_SNAP_RANGE) x = ORB_MARGIN;
+            else if (x >= window.innerWidth - ORB_SIZE - ORB_SNAP_RANGE) x = window.innerWidth - ORB_SIZE - ORB_MARGIN;
+            const y = Math.max(ORB_MARGIN, Math.min(window.innerHeight - ORB_SIZE - ORB_MARGIN, rect.top));
+            orb.style.left = Math.round(x) + 'px';
+            orb.style.top = Math.round(y) + 'px';
             orb.style.right = 'auto';
-            const s = getSettings();
-            s.orbPosition = { x: snapX, y: rect.top };
-            saveSettingsDebounced();
+            orb.style.bottom = 'auto';
+            saveOrbPosition(window, x, y);
             orbSuppressClick = true;
             setTimeout(() => { orbSuppressClick = false; }, 260);
         }
@@ -2617,7 +2682,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.5.0';
+const TF_VERSION = '2.6.0';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
