@@ -259,6 +259,24 @@ function fmtMoney(settings, usd) {
     return `${settings.displayCurrency}${val.toFixed(6)}`;
 }
 
+// 角标专用的紧凑金额：$0.97 / $24.9 / $1.2K —— 位数固定得下那颗球
+function fmtMoneyShort(settings, usd) {
+    const rate = Number(settings.exchangeRate);
+    const val = usd * (Number.isFinite(rate) && rate > 0 ? rate : 1);
+    const cur = typeof settings.displayCurrency === 'string' ? settings.displayCurrency : '$';
+    const abs = Math.abs(val);
+    if (!Number.isFinite(val)) return cur + '0';
+    if (abs >= 1e6) return cur + (val / 1e6).toFixed(1) + 'M';
+    if (abs >= 1e4) return cur + Math.round(val / 1000) + 'K';
+    if (abs >= 1000) return cur + (val / 1000).toFixed(1) + 'K';
+    if (abs >= 100) return cur + Math.round(val);
+    if (abs >= 1) return cur + val.toFixed(1);
+    if (abs >= 0.01) return cur + val.toFixed(2);
+    // 不足一分钱时显示 0.00 会让人以为"根本没花钱"，给一个明确的下界
+    if (abs > 0) return cur + '<0.01';
+    return cur + '0';
+}
+
 function fmtTokens(n) {
     if (!n) return '0';
     if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
@@ -399,23 +417,9 @@ function recordDailyUsage(s, costUsd, tokens, req, isEstimate) {
 // 预算预警：超过 80%/100% 阈值 → 悬浮球角标
 // 旧版只置位、从不清除，角标一旦变成「!」就永远是「!」，跨天也不恢复。
 function checkBudgetAlert(s, costUsd) {
+    // 判定口径统一在 orbAlertMode 里，角标渲染统一在 updateOrbBadge 里
     if (!s.budget || !s.budget.enabled) { clearOrbAlert(); return; }
-    const dailyLimit = s.budget.dailyLimit || 0;
-    const monthlyLimit = s.budget.monthlyLimit || 0;
-    const dailyCost = tfTodayStats(s).cost || 0;
-    // history 里「今天」那条也是当天总额，排除它、直接加 dailyCost，避免今日计两次
-    const monthStr = _todayStr().slice(0, 7);
-    const todayKey = _todayStr();
-    const monthlyCost = s.history.filter(h => h.date !== todayKey && (h.date || '').startsWith(monthStr))
-        .reduce((a, h) => a + (h.cost || 0), 0) + dailyCost;
-
-    let alertMode = null;
-    if (dailyLimit > 0 && dailyCost >= dailyLimit) alertMode = 'over_daily';
-    else if (monthlyLimit > 0 && monthlyCost >= monthlyLimit) alertMode = 'over_month';
-    else if (dailyLimit > 0 && dailyCost >= dailyLimit * 0.8) alertMode = 'warn_daily';
-    else if (monthlyLimit > 0 && monthlyCost >= monthlyLimit * 0.8) alertMode = 'warn_month';
-
-    if (alertMode) setOrbAlert(alertMode);
+    if (orbAlertMode(s)) setOrbAlert();
     else clearOrbAlert();
 }
 
@@ -464,37 +468,71 @@ function contextUsagePercent() {
     return { used: est, limit: ctx, pct: Math.min(100, (est / ctx) * 100) };
 }
 
-// 浮动球角标
-function setOrbAlert(mode) {
-    const s = getSettings();
-    if (s.showOrb === false) return;
-    const orbBadge = document.getElementById('token_flow_orb_badge');
-    if (!orbBadge) return;
-    orbBadge.style.display = '';
-    orbBadge.textContent = '!';
-    orbBadge.classList.add('tf-alert');
-    orbBadge.setAttribute('data-mode', mode);
-}
+// 浮动球角标 —— updateOrbBadge 是唯一的渲染口，别在别处直接改它
+// （旧版 setOrbAlert / clearOrbAlert / updateOrbBadge 三处各写各的，
+//   结果"预警态"和"价格态"会互相卡住：进过一次预警，价格就再也回不来）
+function orbAlertMode(s) {
+    if (!s.budget || !s.budget.enabled) return null;
+    const dailyLimit = s.budget.dailyLimit || 0;
+    const monthlyLimit = s.budget.monthlyLimit || 0;
+    const dailyCost = tfTodayStats(s).cost || 0;
+    // history 里「今天」那条也是当天总额，排除它、直接加 dailyCost，避免今日计两次
+    const monthStr = _todayStr().slice(0, 7);
+    const todayKey = _todayStr();
+    const monthlyCost = (Array.isArray(s.history) ? s.history : [])
+        .filter(h => h && h.date !== todayKey && (h.date || '').startsWith(monthStr))
+        .reduce((a, h) => a + (h.cost || 0), 0) + dailyCost;
 
-function clearOrbAlert() {
-    const orbBadge = document.getElementById('token_flow_orb_badge');
-    if (orbBadge) { orbBadge.style.display = 'none'; orbBadge.classList.remove('tf-alert'); }
+    if (dailyLimit > 0 && dailyCost >= dailyLimit) return 'over_daily';
+    if (monthlyLimit > 0 && monthlyCost >= monthlyLimit) return 'over_month';
+    if (dailyLimit > 0 && dailyCost >= dailyLimit * 0.8) return 'warn_daily';
+    if (monthlyLimit > 0 && monthlyCost >= monthlyLimit * 0.8) return 'warn_month';
+    return null;
 }
 
 function updateOrbBadge() {
-    const s = getSettings();
-    if (s.showOrb === false) { clearOrbAlert(); return; }
     const badge = document.getElementById('token_flow_orb_badge');
     if (!badge) return;
-    const dailyCost = (s.dailyStats && s.dailyStats.cost) || 0;
-    // 有预算预警时显示预警角标，否则显示今日费用
-    if (badge.classList.contains('tf-alert')) return;
-    if (dailyCost > 0) {
+    const s = getSettings();
+    if (s.showOrb === false) {
+        badge.style.display = 'none';
+        badge.classList.remove('tf-alert');
+        return;
+    }
+
+    // 1) 预算预警优先：显示 "!"，并让 CSS 换成警示色
+    const mode = orbAlertMode(s);
+    if (mode) {
+        badge.classList.add('tf-alert');
+        badge.setAttribute('data-mode', mode);
+        badge.removeAttribute('data-scope');   // 别留着上一轮的价格口径
+        badge.textContent = '!';
         badge.style.display = '';
-        badge.textContent = fmtMoney(s, dailyCost);
+        return;
+    }
+    badge.classList.remove('tf-alert');
+    badge.removeAttribute('data-mode');
+
+    // 2) 平时显示今日费用。今天还没消费（跨天 / 刚装好）就退回累计费用 ——
+    //    旧版这里直接 display:none，用户看到的就是"价格有时候会消失"。
+    const todayCost = tfTodayStats(s).cost || 0;
+    const totalCost = (s.stats && s.stats.totalCost) || 0;
+    const value = todayCost > 0 ? todayCost : totalCost;
+    if (value > 0) {
+        badge.textContent = fmtMoneyShort(s, value);
+        badge.setAttribute('data-scope', todayCost > 0 ? 'today' : 'total');
+        badge.style.display = '';
     } else {
         badge.style.display = 'none';
     }
+}
+
+// 保留旧名字：别处还在调
+function setOrbAlert() { updateOrbBadge(); }
+function clearOrbAlert() {
+    const badge = document.getElementById('token_flow_orb_badge');
+    if (badge) { badge.classList.remove('tf-alert'); badge.removeAttribute('data-mode'); }
+    updateOrbBadge();
 }
 
 // 每日用量简报（写入聊天流提示，可关闭）
@@ -1825,13 +1863,17 @@ function applyTheme() {
             document.getElementById('token_flow_panel'),
             document.getElementById('token_flow_drawer'),
             document.getElementById('token_flow_dashboard'),
+            // 悬浮球也要挂上：主题变量块选择器是 [data-tf-theme="x"]，
+            // 不挂的话球永远只能用兜底色，浅色宿主下就成了一颗"白圈"（真机反馈难看）
+            document.getElementById('token_flow_orb'),
         ];
         for (const el of containers) {
             if (el) el.setAttribute('data-tf-theme', theme);
         }
-        // 同步悬浮球图标用色（可选）
+        // 图标颜色交给 CSS（.tf-orb-icon 用 var(--tf-accent)），这里不再写内联，
+        // 否则内联样式会盖住主题色
         const orbIcon = document.querySelector('.tf-orb-icon');
-        if (orbIcon) orbIcon.style.color = 'var(--tf-accent, #5eead4)';
+        if (orbIcon) orbIcon.style.color = '';
     } catch (e) {
         console.warn('[SillyToken] applyTheme:', e);
     }
@@ -1889,7 +1931,7 @@ function resetSessionStats() {
  * ============================================================ */
 
 const ORB_SIZE = 56;
-const ORB_MARGIN = 8;         // 球离屏幕边缘至少留这么多
+const ORB_MARGIN = 16;        // 球离屏幕边缘至少留这么多（右上角还有价格角标要放）
 const ORB_SNAP_RANGE = 24;    // 松手时离边这么近才吸附，否则停在你放的位置
 let orbDragState = null;
 let orbSuppressClick = false;
@@ -1963,7 +2005,7 @@ function ensureFloatingUI() {
     const fragment = document.createElement('div');
     fragment.innerHTML = `
         <button class="tf-orb" id="token_flow_orb" type="button" aria-label="${safeT('打开用量统计')}" title="SillyToken · ${safeT('用量统计')}">
-            <span class="tf-orb-icon fa-solid fa-chart-line"></span>
+            <span class="tf-orb-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 16.8 8.8 11l3.7 3.7L20.5 6.9"/><path d="M15.2 6.9h5.3v5.3"/></svg></span>
             <span class="tf-orb-badge" id="token_flow_orb_badge" style="display:none"></span>
         </button>
         <div class="tf-panel-scrim" id="token_flow_panel_scrim" style="display:none"></div>
@@ -2120,6 +2162,7 @@ function ensureFloatingUI() {
         });
     }
     applyTheme();
+    updateOrbBadge();   // 刚挂载时角标是隐藏的，这里补一次，别等下一次请求
 
     // 复制用量摘要
     const copyBtn = document.getElementById('token_flow_copy_summary');
@@ -2305,6 +2348,7 @@ function addExtensionSettingsInto(content) {
     sw4Input.addEventListener('change', () => {
         const orbe = document.getElementById('token_flow_orb');
         if (orbe) orbe.style.display = sw4Input.checked ? '' : 'none';
+        updateOrbBadge();   // 关掉再打开时，角标状态要跟着回来
     });
 
     // 打开统计面板按钮
@@ -2703,7 +2747,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.6.1';
+const TF_VERSION = '2.7.0';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;

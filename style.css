@@ -371,8 +371,6 @@
         linear-gradient(135deg,
             color-mix(in srgb, var(--SmartThemeBlurTintColor, #2c3e50) 92%, transparent),
             color-mix(in srgb, var(--SmartThemeBlurTintColor, #1a252f) 78%, transparent));
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
     box-shadow:
         0 0 22px color-mix(in srgb, var(--tf-accent, #5eead4) 55%, transparent),
         inset 0 1px 1px rgba(255, 255, 255, 0.25),
@@ -387,7 +385,7 @@
     transition: transform 200ms cubic-bezier(.34, 1.56, .64, 1), box-shadow 240ms ease, border-color 240ms ease;
     appearance: none;
     -webkit-appearance: none;
-    animation: tfOrbFloat 6s ease-in-out infinite;
+    /* v2.7.0：去掉无限 box-shadow 动画（每帧重绘，平板纯耗电） */
 }
 
 /* 呼吸式主题光晕 */
@@ -610,7 +608,7 @@
 }
 @keyframes tfAlertPulse {
     0%, 100% { transform: scale(1); }
-    50% { transform: scale(1.25); }
+    50% { transform: scale(1.12); }
 }
 
 /* ============================================================
@@ -1680,3 +1678,109 @@
         bottom: calc(88px + env(safe-area-inset-bottom, 0px));
     }
 }
+
+/* ============================================================
+ *  v2.7.0 · 悬浮球重做
+ *  旧版球体背景全靠酒馆的 --SmartThemeBlurTintColor 调，浅色宿主下就是
+ *  "白底 + 浅色图标"，几乎看不见（真机截图实证）。
+ *  改成「深色球体 + 主题强调色」：任何宿主主题下都清楚，而且球本身挂了
+ *  data-tf-theme，会跟着面板那 5 套配色一起变。
+ * ============================================================ */
+.tf-orb {
+    box-sizing: border-box;
+    padding: 0;
+    border-color: color-mix(in srgb, var(--tf-accent, #5eead4) 55%, transparent);
+    background:
+        radial-gradient(circle at 32% 24%, color-mix(in srgb, var(--tf-accent, #5eead4) 44%, transparent), transparent 62%),
+        linear-gradient(150deg,
+            color-mix(in srgb, var(--tf-accent, #5eead4) 20%, #10141d),
+            #0a0d14);
+    box-shadow:
+        inset 0 1px 1px rgba(255, 255, 255, 0.08),
+        0 0 0 1px rgba(255, 255, 255, 0.10),
+        0 10px 26px rgba(0, 0, 0, 0.42),
+        0 0 18px color-mix(in srgb, var(--tf-accent, #5eead4) 30%, transparent);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    animation: none;
+}
+/* 触屏上没有 hover，别让 :hover 状态粘住 */
+@media (hover: hover) {
+    .tf-orb:hover {
+        transform: translateY(-3px);
+        border-color: color-mix(in srgb, var(--tf-accent, #5eead4) 85%, transparent);
+        box-shadow:
+            inset 0 1px 1px rgba(255, 255, 255, 0.1),
+            0 0 0 1px rgba(255, 255, 255, 0.14),
+            0 14px 30px rgba(0, 0, 0, 0.5),
+            0 0 26px color-mix(in srgb, var(--tf-accent, #5eead4) 50%, transparent);
+    }
+}
+.tf-orb:active,
+.tf-orb.is-dragging { transform: scale(1.06); transition: none; }
+.tf-orb:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--tf-accent, #5eead4) 80%, transparent);
+    outline-offset: 3px;
+}
+.tf-orb.is-open {
+    border-color: var(--tf-accent, #5eead4);
+    box-shadow:
+        inset 0 1px 1px rgba(255, 255, 255, 0.1),
+        0 12px 30px rgba(0, 0, 0, 0.45),
+        0 0 0 4px color-mix(in srgb, var(--tf-accent, #5eead4) 26%, transparent);
+}
+.tf-orb-icon {
+    width: 24px;
+    height: 24px;
+    font-size: 22px;
+    line-height: 1;
+    /* 深色球体上，纯强调色在「纯白极简」这类浅主题里偏灰（#64748b），
+       用 brightness 提亮；亮色主题仍然鲜艳，暗色主题被提到看得清。
+       不用 color-mix：它的计算值是 color(srgb ...)，对比度探针解析不了。 */
+    color: var(--tf-accent, #5eead4);
+    filter: drop-shadow(0 0 4px rgba(0, 0, 0, 0.45)) drop-shadow(0 0 8px color-mix(in srgb, var(--tf-accent, #5eead4) 55%, transparent)) brightness(1.3) saturate(1.06);
+}
+.tf-orb-icon svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+    overflow: visible;
+}
+@media (hover: hover) {
+    .tf-orb:hover .tf-orb-icon { transform: scale(1.08); }
+}
+
+/* 价格角标：做成右上角的小吊牌，不再是横着拖出去的长条。
+   旧版红底 + 六位小数（$0.974171），宽度超过球本身，整条盖在图标上。 */
+.tf-orb-badge {
+    top: -6px;
+    right: -6px;
+    min-width: 0;
+    height: auto;
+    max-width: 58px;
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #ffffff, #e9eef5);
+    color: #101725;
+    border: 1px solid rgba(15, 23, 42, 0.14);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 14px;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+    pointer-events: none;
+}
+.tf-orb-badge.tf-alert {
+    /* 白字要过 AA：原先的 #ff5a4d 只有 3.1:1，10px 的 "!" 根本看不清 */
+    background: linear-gradient(180deg, #dc2626, #b91c1c);
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.28);
+    padding: 2px 8px;
+    animation: tfAlertPulse 1.1s ease-in-out infinite;
+}
+/* 角标显示的是「今日」还是「累计」—— 给调试和测试留个钩子 */
+.tf-orb-badge[data-scope="total"] { opacity: 0.94; }
