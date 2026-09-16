@@ -2573,12 +2573,12 @@ function addExtensionSettingsInto(content) {
     row(span(safeT('显示币种')),
         makeInput('tf_currency', 'text', s.displayCurrency, () => {
             s.displayCurrency = document.getElementById('tf_currency').value || '$';
-            saveSettingsDebounced(); updateDashboard();
+            saveSettingsDebounced(); updateOrbBadge(); updateDashboard();
         }));
     row(span(safeT('汇率 (1 USD = ?)')),
         makeInput('tf_rate', 'number', s.exchangeRate, () => {
             const v = parseFloat(document.getElementById('tf_rate').value);
-            if (v > 0) { s.exchangeRate = v; saveSettingsDebounced(); updateDashboard(); }
+            if (v > 0) { s.exchangeRate = v; saveSettingsDebounced(); updateOrbBadge(); updateDashboard(); }
         }));
 
     // 模型价格编辑表
@@ -2735,7 +2735,9 @@ function addExtensionSettingsInto(content) {
     budgetCb.checked = !!(s.budget && s.budget.enabled);
     budgetCb.addEventListener('change', () => {
         s.budget.enabled = budgetCb.checked; saveSettingsDebounced();
-        if (!budgetCb.checked) clearOrbAlert();
+        // 旧版只有"取消勾选"才动角标：勾上预算后要等下一次请求才变 "!"，
+        // 看着像开关没生效。统一交给 updateOrbBadge 立刻重画。
+        clearOrbAlert();
         updateDashboard();
     });
     budgetLab.append(budgetCb);
@@ -2744,12 +2746,12 @@ function addExtensionSettingsInto(content) {
     row(span(safeT('今日限额 ($/1M)')),
         makeInput('tf_budget_daily', 'number', s.budget && s.budget.dailyLimit, () => {
             const v = parseFloat(document.getElementById('tf_budget_daily').value);
-            s.budget.dailyLimit = isNaN(v) ? 0 : v; saveSettingsDebounced(); updateDashboard();
+            s.budget.dailyLimit = isNaN(v) ? 0 : v; saveSettingsDebounced(); updateOrbBadge(); updateDashboard();
         }));
     row(span(safeT('月度限额 ($/1M)')),
         makeInput('tf_budget_monthly', 'number', s.budget && s.budget.monthlyLimit, () => {
             const v = parseFloat(document.getElementById('tf_budget_monthly').value);
-            s.budget.monthlyLimit = isNaN(v) ? 0 : v; saveSettingsDebounced(); updateDashboard();
+            s.budget.monthlyLimit = isNaN(v) ? 0 : v; saveSettingsDebounced(); updateOrbBadge(); updateDashboard();
         }));
 
     // ============ v1.1.0 新增配置：上下文监控 ============
@@ -2945,7 +2947,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.7.2';
+const TF_VERSION = '2.7.3';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
