@@ -24,7 +24,7 @@ iframe 里，用的是它们自己的 `window.fetch` / `XMLHttpRequest`，普通
 
 > 本修改版为个人自用而做，同时公开发布。原项目的版权归原作者所有。
 
-## 与原版的差异（v2.7.1）
+## 与原版的差异（v2.7.2）
 
 ### 1. 请求捕获层重写（这是 fork 的主要原因）
 
@@ -182,6 +182,37 @@ iframe 里，用的是它们自己的 `window.fetch` / `XMLHttpRequest`，普通
 
 **怎么自查**：面板底部运行日志里找 `capture.estimated` / `capture.missed`，
 `reason` 字段直接告诉你原因（例如 `响应里返回了错误: insufficient quota`）。
+
+### 14. v2.7.2 · 补齐官方价 + 认得中转的模型名前缀
+
+新增 4 档（2026-09-16 查的官方价，USD / 1M tokens）：
+
+| 模型 | 输入 | 输出 | 缓存输入 | 来源 |
+| --- | --- | --- | --- | --- |
+| `gemini-3-flash` | 0.50 | 3.00 | 0.05 | Google 官方 |
+| `gemini-2.5-pro` | 1.25 | 10.00 | 0.125 | Google 官方（≤200K 上下文；>200K 为 2.50 / 15） |
+| `gemma-4-31b-it` | 0.15 | 0.60 | — | Google Vertex AI |
+| `gemma-4-26b-a4b-it` | 0.15 | 0.60 | — | Google Vertex AI |
+
+`gemini-3.1-pro`（2.00 / 12.00 / 0.40）原表已有，这次核对过与官方一致。
+
+**模型名归一化现在能剥中转前缀**：
+
+- `假流式-gemini-2.5-pro-search` → `gemini-2.5-pro`（中文前缀 + `-search` 装饰）
+- `[NV]gemma-26b-a4b-it` → `gemma-4-26b-a4b-it`（方括号标记）
+- `google/gemma-4-31b-it` → `gemma-4-31b-it`（vendor/ 前缀，原本就支持）
+
+顺带修了一个连带 bug：`26b` / `120b` 这类**参数量标签**原来被当成"代际版本"，
+于是 `gemma-26b-a4b-it` 与价格表里的 `gemma-4-26b-a4b-it` 被判成"跨版本"而拒绝匹配
+（表现为一直显示未设单价）。现在参数量标签不参与代际比较，跨版本红线照旧
+（`gemini-2.5-flash` 仍然不会被算成 `gemini-3.x-flash`）。
+
+**没查到官方价的**（开源权重，价格由托管方定，没有唯一"官方价"）：
+
+- `google/diffusiongemma-26b-a4b-it` —— Artificial Analysis 上报价为 $0.00（未收录）
+- `nvidia/nemotron-3-super-120b-a12b` —— NVIDIA 自家按 GPU 时长计费，第三方按 token 计费
+
+这两个保持「未设单价」，面板会提示你一键补入；要按你中转的实际标价填。
 
 ---
 

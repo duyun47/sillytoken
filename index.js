@@ -37,6 +37,15 @@ const PRESET_MODELS = [
     { name: 'gemini-3.5-flash',   input: 1.50, output: 7.50,  cached: 0.30,   perRequest: 0, multiplier: 1 },
     { name: 'gemini-3.6-flash',   input: 1.50, output: 7.50,  cached: 0.30,   perRequest: 0, multiplier: 1 },
     { name: 'gemini-3.7-flash',   input: 0.75, output: 3.75,  cached: 0.15,   perRequest: 0, multiplier: 1 },
+    // ---- v2.7.2 补齐 ----
+    // Google 官方：Gemini 3 Flash $0.50 / $3.00，缓存输入 $0.05
+    { name: 'gemini-3-flash',     input: 0.50, output: 3.00,  cached: 0.05,   perRequest: 0, multiplier: 1 },
+    // Google 官方：Gemini 2.5 Pro $1.25 / $10.00（≤200K 上下文；>200K 为 $2.50 / $15）
+    { name: 'gemini-2.5-pro',     input: 1.25, output: 10.00, cached: 0.125,  perRequest: 0, multiplier: 1 },
+    // Gemma 4 是开源权重，没有唯一的"官方价"：这里取 Google 自家 Vertex AI 的报价
+    // （第三方更便宜：DeepInfra $0.09、OpenRouter $0.13 —— 以你的中转实际标价为准就改这两行）
+    { name: 'gemma-4-31b-it',     input: 0.15, output: 0.60,  cached: 0,      perRequest: 0, multiplier: 1 },
+    { name: 'gemma-4-26b-a4b-it', input: 0.15, output: 0.60,  cached: 0,      perRequest: 0, multiplier: 1 },
     // Anthropic
     { name: 'claude-opus-4.6',    input: 15.00, output: 75.00, cached: 1.50,  perRequest: 0, multiplier: 1 },
     { name: 'claude-sonnet-4.6',  input: 3.00, output: 15.00, cached: 0.30,   perRequest: 0, multiplier: 1 },
@@ -58,7 +67,7 @@ const defaultSettings = {
     showOrb: true,
     orbPosition: null,
     models: structuredClone(PRESET_MODELS),
-    modelVersion: 20260819,
+    modelVersion: 20260916,
     stats: { models: {}, totalCost: 0, totalTokens: 0, totalRequests: 0 },
     session: { models: {}, totalCost: 0, totalTokens: 0, totalRequests: 0 },
     sessionStartedAt: Date.now(),
@@ -2936,7 +2945,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.7.1';
+const TF_VERSION = '2.7.2';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
@@ -3318,10 +3327,13 @@ const TF_VERSION_TOKEN = /^(v?\d+([.\-]\d+)*|\d+[bkm]|preview|latest|beta|rc|sta
 
 function tfCanonicalModel(name) {
     let n = String(name || '').toLowerCase().trim();
+    n = n.replace(/^\[[^\]]{1,10}\]\s*[-_]?/, '');                        // [NV] 这类中转标记
+    n = n.replace(/^[\u4e00-\u9fff]{1,10}[-_]/, '');                       // 假流式- / 官转- 这类中文前缀
     n = n.replace(/^[a-z0-9_.-]+\//, '');                                  // vendor/ 前缀
     n = n.replace(/[_\s]+/g, '-');
     n = n.replace(/-(20\d{6}|20\d{2}-\d{2}-\d{2})$/, '');                  // 日期尾巴
-    n = n.replace(/[-:](preview|latest|beta|rc|stable|exp|free|nitro)\d*$/g, '');
+    // search = 带联网检索的同款模型，token 单价不变（检索另计费），当装饰剥掉
+    n = n.replace(/[-:](preview|latest|beta|rc|stable|exp|free|nitro|search)\d*$/g, '');
     n = n.replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');
     return n;
 }
@@ -3333,7 +3345,9 @@ function tfSignificantTokens(canonical) {
 
 /** 只取版本/修饰词：gemini-3.5-flash -> [3.5]；deepseek-flash -> []（没有版本信息） */
 function tfVersionTokens(canonical) {
-    return String(canonical || '').split('-').filter((t) => t && TF_VERSION_TOKEN.test(t));
+    // 26b / 120b / 4b 这类是参数量标签，不是代际：不参与"跨版本"比较
+    return String(canonical || '').split('-')
+        .filter((t) => t && TF_VERSION_TOKEN.test(t) && !/^\d+[bkm]$/.test(t));
 }
 
 function tfAliasList(entry) {
