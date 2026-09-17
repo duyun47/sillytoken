@@ -1860,3 +1860,69 @@
         padding: 14px 12px calc(14px + env(safe-area-inset-bottom, 0px));
     }
 }
+
+/* ============================================================
+ *  v2.8.0 · 浮层定位改由 JS 负责，CSS 不再参与定位
+ *
+ *  原因是「可见性依赖 CSS 定位」这件事本身不适配：fixed 相对视口、bottom 贴边、
+ *  vh/dvh、transform 居中、媒体查询切换定位策略 —— 这些假设会被浏览器逐个打破
+ *  （荣耀 Edge + 酒馆移动端就是同时打破了其中好几个）。
+ *
+ *  现在：JS 量出包含块原点后用像素写 left/top/width/max-height，
+ *  CSS 这里只保留「万一 JS 没跑到」时的兜底值。
+ * ============================================================ */
+.tf-panel {
+    top: 0;
+    left: 0;
+    right: auto;
+    bottom: auto;
+    transform: none;
+    width: auto;
+    max-width: none;
+    /* 三级兜底：JS 没跑到时也不至于没有高度上限 */
+    max-height: 88vh;
+    max-height: min(88vh, 640px);
+    max-height: min(88dvh, 640px);
+}
+/* 窄屏不再由媒体查询改定位（那正是上一版踩的坑），只留外观 */
+@media (max-width: 560px) {
+    .tf-panel {
+        top: 0;
+        left: 0;
+        right: auto;
+        bottom: auto;
+        transform: none;
+        width: auto;
+        max-width: none;
+        border-radius: 14px;
+    }
+    .tf-panel-title span { display: none; }
+    .tf-panel-actions .menu_button,
+    .tf-theme-switch-btn {
+        min-width: 30px;
+        padding: 5px 6px;
+        font-size: 13px;
+    }
+    .tf-panel-body {
+        padding: 14px 12px;
+    }
+}
+
+/* 底部关闭按钮：表头万一被顶出屏幕，这里一定点得到（结构性保险） */
+.tf-panel-footer {
+    flex: 0 0 auto;
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--tf-border, var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.2)));
+    background: color-mix(in srgb, var(--tf-surface, rgba(0, 0, 0, 0.2)) 60%, transparent);
+}
+.tf-panel-footer .tf-footer-close {
+    flex: 0 1 260px;
+    padding: 9px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    border-radius: 10px;
+}
+.tf-panel-body { min-height: 0; }

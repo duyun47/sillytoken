@@ -2138,34 +2138,93 @@ let orbSuppressClick = false;
 
 const orbClamp01 = (v) => Math.min(1, Math.max(0, v));
 
-/**
- * 把「position:fixed 的包含块被祖先劫持」这个坑补回来。
+/* ---------- 浮层定位：只认实测值（v2.8.0 重做） ----------
+
+ * 以前这套 UI 的可见性建立在 7 个隐式假设上，每个都能被某个浏览器单独打破：
+ *   ① position:fixed 相对视口      ② bottom/right 能正确贴边
+ *   ③ vh/dvh = 真实视口高           ④ transform 居中可用
+ *   ⑤ margin 能移动元素            ⑥ 媒体查询切换定位策略
+ *   ⑦ env(safe-area) 一定可用
+ * 荣耀 Edge 上 ①②③④⑥ 被同时打破（根元素带 transform / 缩放），于是
+ * 「球看不见、面板跑到屏幕外、关不掉」。逐条打补丁只会等来第 8 个假设。
  *
- * 荣耀手机的 Edge 里，酒馆移动端布局会给 body 加 transform（GPU 合成），
- * 于是 body 成了 position:fixed 的包含块；而 body 在文档流里高度是 0
- * （移动端元素几乎全是 fixed）—— 所有 fixed 元素都不再相对视口定位：
- *   bottom:96px 变成「页面顶部往上 96px」→ 球直接看不见
- *   top:50%     变成 0                      → 面板上半截在屏幕外
- *   inset:0     变成 0 高                   → 遮罩等于没铺
- * （真机日志实测：viewport 732x1333 时球落在 top -152 / bottom -96，与本地复现一致）
- *
- * 第一道防线是挂到 <html> 上（绕开 body 这个包含块）；这里是第二道：
- * 摆完实测一次，把差值用 margin 补回来 —— margin 只挪位置、不干扰 transform，
- * 而且不管包含块是谁，这个差值都能测出来。
+ * 改成三条不随环境变化的规矩：
+ *   1) 只认实测值：先量出「包含块原点」，再把目标位置换算成 left/top 的像素
+ *   2) 先钳高度再算位置：H ≤ 视口高 − 2m ⇒ 位置必然落在 [m, 视口高 − m − H]
+ *   3) 摆完就验，验不过就降级（贴满全屏 → 回到文档流）
  */
-function tfFixContainingBlock(win, el, wantLeft, wantTop) {
+
+/** 视口尺寸。visualViewport 更接近肉眼可见区域，没有就退回 innerWidth/Height */
+function tfViewport(win) {
+    const w = win || (typeof window !== 'undefined' ? window : null);
+    if (!w) return { vw: 0, vh: 0 };
+    let vw = 0, vh = 0;
+    try {
+        const vv = w.visualViewport;
+        if (vv && vv.width > 0 && vv.height > 0) { vw = vv.width; vh = vv.height; }
+    } catch { /* ignore */ }
+    if (!vw || !vh) { vw = w.innerWidth || 0; vh = w.innerHeight || 0; }
+    return { vw: Math.round(vw), vh: Math.round(vh) };
+}
+
+/**
+ * 量出「包含块原点」：元素摆到 left/top = 0 时，它在屏幕上的真实位置。
+ *
+ * 这是整套定位的基准。position:fixed 的包含块不一定是视口 —— 祖先带 transform、
+ * 根元素被 zoom 时会变成别的东西（可能只有 0 高、还在页面顶部），那时候
+ * bottom / vh / 百分比 / transform 居中全都会算错。
+ * 但「摆到 0,0 量一次」在任何包含块下都是准的，这就是适配性的来源。
+ */
+function tfMeasureOrigin(el) {
     if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+    const keep = { l: el.style.left, t: el.style.top, ml: el.style.marginLeft, mt: el.style.marginTop };
+    el.style.left = '0px';
+    el.style.top = '0px';
     el.style.marginLeft = '0px';
     el.style.marginTop = '0px';
-    const rect = el.getBoundingClientRect();
-    if (!rect || (rect.width === 0 && rect.height === 0)) return null;
-    const dx = Math.round(wantLeft - rect.left);
-    const dy = Math.round(wantTop - rect.top);
-    if (dx || dy) {
-        el.style.marginLeft = dx + 'px';
-        el.style.marginTop = dy + 'px';
-    }
-    return { dx, dy };
+    const r = el.getBoundingClientRect();
+    el.style.left = keep.l;
+    el.style.top = keep.t;
+    el.style.marginLeft = keep.ml;
+    el.style.marginTop = keep.mt;
+    return r ? { x: r.left, y: r.top } : null;
+}
+
+/**
+ * px 缩放系数。
+ *
+ * 有的浏览器（Edge 的「字体大小 / 缩放」在某些版本）会在根元素上做 zoom，
+ * 这时我写进去的 "716px" 在屏幕上量回来是 716 × zoom ——
+ * 尺寸被缩了、位置也会偏，遮罩就铺不满、面板会缩成一小块。
+ *
+ * 用一根 1000px 的探针把它实测出来，写值时除掉；正常环境下系数是 1，等于没做。
+ */
+function tfPixelScale(win) {
+    try {
+        const doc = win.document;
+        if (!doc || !doc.createElement || !doc.documentElement) return 1;
+        const probe = doc.createElement('div');
+        probe.style.cssText = 'position:absolute;left:-99999px;top:0;width:1000px;height:1px;pointer-events:none;visibility:hidden';
+        doc.documentElement.appendChild(probe);
+        const w = probe.getBoundingClientRect().width;
+        probe.remove();
+        if (!w || !isFinite(w)) return 1;
+        const s = w / 1000;
+        return (s > 0.2 && s < 5) ? s : 1;
+    } catch { return 1; }
+}
+
+/** 把元素摆到「屏幕坐标 (x, y)」——换算成相对包含块原点的像素，不用 bottom/transform */
+function tfPlaceAt(el, origin, x, y, scale) {
+    if (!el || !origin) return;
+    const s = (typeof scale === 'number' && scale > 0) ? scale : 1;
+    el.style.marginLeft = '0px';
+    el.style.marginTop = '0px';
+    el.style.right = 'auto';
+    el.style.bottom = 'auto';
+    el.style.transform = 'none';
+    el.style.left = Math.round((x - origin.x) / s) + 'px';
+    el.style.top = Math.round((y - origin.y) / s) + 'px';
 }
 
 /**
@@ -2176,14 +2235,18 @@ function tfFixContainingBlock(win, el, wantLeft, wantTop) {
  * 在电脑上把球拖到底部（fy≈1），到手机上就贴着视口底边 = 看不见。
  * 所以底部预留一段，比例映射到这个区间里。
  */
-function orbRange(win) {
+function orbRange(win, scale) {
     const vw = win.innerWidth || 0;
     const vh = win.innerHeight || 0;
-    const insBottom = vw <= 768 ? ORB_BOTTOM_INSET : ORB_MARGIN;
-    const minX = ORB_MARGIN;
-    const minY = ORB_MARGIN;
-    const maxX = Math.max(minX, vw - ORB_SIZE - ORB_MARGIN);
-    const maxY = Math.max(minY, vh - ORB_SIZE - insBottom);
+    // 根元素被 zoom 时，球的 CSS 56px 在屏幕上会变成 56 × zoom，安全区要按实际占位算
+    const s = (typeof scale === 'number' && scale > 0) ? scale : 1;
+    const size = ORB_SIZE * s;
+    const margin = ORB_MARGIN * s;
+    const insBottom = (vw <= 768 ? ORB_BOTTOM_INSET : ORB_MARGIN) * s;
+    const minX = margin;
+    const minY = margin;
+    const maxX = Math.max(minX, vw - size - margin);
+    const maxY = Math.max(minY, vh - size - insBottom);
     return { minX, minY, maxX, maxY, spanX: Math.max(1, maxX - minX), spanY: Math.max(1, maxY - minY) };
 }
 
@@ -2194,8 +2257,8 @@ function orbRange(win) {
  * 旧数据是像素 { x, y }：用当前视口折算一次再夹到 0~1 —— 同一屏幕上结果完全一致，
  * 换到窄屏则被拉进安全区（而不是丢在屏幕外或底栏后面）。
  */
-function readOrbPosition(win) {
-    const range = orbRange(win);
+function readOrbPosition(win, scale) {
+    const range = orbRange(win, scale);
     // 没存过位置 / 数据是脏的 → 用默认角落（右下，安全区内），
     // 不能返回 null：摆完要实测校准，得有一个明确的预期坐标
     const fallback = { x: range.maxX, y: range.maxY };
@@ -2229,17 +2292,14 @@ function readOrbPosition(win) {
 
 function applyOrbPosition(win, orb, pos) {
     if (!pos) return;
-    orb.style.left = Math.round(pos.x) + 'px';
-    orb.style.top = Math.round(pos.y) + 'px';
-    orb.style.right = 'auto';
-    orb.style.bottom = 'auto';
-    // 摆完实测一次：包含块被劫持的浏览器里，实际位置会和预期差一大截
-    tfFixContainingBlock(win, orb, pos.x, pos.y);
+    const origin = tfMeasureOrigin(orb);
+    if (!origin) return;
+    tfPlaceAt(orb, origin, pos.x, pos.y, tfPixelScale(win));
 }
 
-/** 松手后落盘：写比例，不写像素 */
-function saveOrbPosition(win, x, y) {
-    const range = orbRange(win);
+/** 松手后落盘：写比例，不写像素（比例要和还原时用同一个安全区） */
+function saveOrbPosition(win, x, y, scale) {
+    const range = orbRange(win, scale);
     const s = getSettings();
     s.orbPosition = {
         fx: orbClamp01((x - range.minX) / range.spanX),
@@ -2249,41 +2309,105 @@ function saveOrbPosition(win, x, y) {
 }
 
 /**
- * 面板 + 遮罩的几何校准（每次渲染后、视口变化后调用）。
+ * 浮层定位总入口（每次渲染后、视口变化后调用）。
  *
- * CSS 里面板是「居中」或「贴底」，遮罩是 inset:0 —— 这些在包含块被劫持的
- * 浏览器里全都会算错：面板上半截出屏、遮罩缩成 0 高一条。
- * 这里按视口算出预期位置，再用实测差值补回来。
+ * 三档，逐级降级，任何一档都保证「表头在屏内 + 底部关闭按钮可点」：
+ *   L0 正常：量原点 → 钳高度 → 窄屏贴底 / 宽屏居中
+ *   L1 贴满：视口多大就多大
+ *   L2 回文档流：放弃 position:fixed（至少内容与关闭按钮看得见、能滚）
  */
+const TF_OVERLAY_MARGIN = 8;
+let tfLastPlaceLevel = -1;
+
+function tfPanelOk(panel, vh) {
+    try {
+        const r = panel.getBoundingClientRect();
+        if (!r || r.height <= 0 || r.width <= 0) return false;
+        const header = panel.querySelector('.tf-panel-header');
+        const hr = header ? header.getBoundingClientRect() : r;
+        // 表头必须完整在屏内，面板底边也不能跑到屏幕外
+        return hr.top >= -1 && hr.bottom <= vh + 1 && r.bottom <= vh + 2 && r.top >= -1;
+    } catch { return false; }
+}
+
 function tfSyncFloatingGeometry() {
     try {
         const win = window;
-        const vw = win.innerWidth || 0;
-        const vh = win.innerHeight || 0;
-        if (!vw || !vh) return;
+        const { vw, vh } = tfViewport(win);
+        if (vw < 60 || vh < 60) return;
+        const M = TF_OVERLAY_MARGIN;
+        // px 缩放系数：根元素被 zoom 时，写进去的 px 会被再乘一次，这里除掉
+        const S = tfPixelScale(win);
 
         const scrim = document.getElementById('token_flow_panel_scrim');
         if (scrim && scrim.style.display !== 'none') {
-            scrim.style.left = '0px';
-            scrim.style.top = '0px';
-            scrim.style.right = 'auto';
-            scrim.style.bottom = 'auto';
-            scrim.style.width = vw + 'px';
-            scrim.style.height = vh + 'px';
-            tfFixContainingBlock(win, scrim, 0, 0);
+            const so = tfMeasureOrigin(scrim);
+            scrim.style.width = Math.round(vw / S) + 'px';
+            scrim.style.height = Math.round(vh / S) + 'px';
+            tfPlaceAt(scrim, so, 0, 0, S);
         }
 
         const panel = document.getElementById('token_flow_panel');
-        if (panel && panel.style.display !== 'none') {
-            const rect = panel.getBoundingClientRect();
-            if (rect && rect.width > 0) {
-                // 窄屏是贴底的面板，宽屏是居中
-                const wantLeft = Math.round((vw - rect.width) / 2);
-                const wantTop = vw <= 560 ? Math.round(vh - rect.height) : Math.round((vh - rect.height) / 2);
-                tfFixContainingBlock(win, panel, wantLeft, wantTop);
-            }
+        if (!panel || panel.style.display === 'none') return;
+
+        // 每次都从「干净状态」量：清掉上一轮的写入，免得影响测量
+        panel.style.position = '';
+        panel.style.width = 'auto';
+        panel.style.maxHeight = 'none';
+        panel.style.height = 'auto';
+        const origin = tfMeasureOrigin(panel);
+        if (!origin) return;
+
+        // ① 先钳高度（关键：位置只由视口决定，绝不由内容高度决定）
+        const natural = panel.getBoundingClientRect().height || 0;
+        const W = Math.max(240, Math.min(720, vw - 2 * M));
+        const H = Math.max(140, Math.min(natural, vh - 2 * M));
+
+        // ② 再算位置：窄屏贴底、宽屏居中，都落在 [M, vh − M − H]
+        const narrow = vw <= 560;
+        const wantX = M + Math.max(0, (vw - 2 * M - W) / 2);
+        const wantY = narrow ? (vh - M - H) : (M + Math.max(0, (vh - 2 * M - H) / 2));
+
+        panel.style.width = Math.round(W / S) + 'px';
+        panel.style.maxHeight = Math.round(H / S) + 'px';
+        tfPlaceAt(panel, origin, wantX, wantY, S);
+        let level = 0;
+
+        // ③ 摆完就验，验不过降级
+        if (!tfPanelOk(panel, vh)) {
+            level = 1;
+            panel.style.width = Math.round(vw / S) + 'px';
+            panel.style.maxHeight = Math.round(vh / S) + 'px';
+            tfPlaceAt(panel, origin, 0, 0, S);
         }
-    } catch { /* ignore */ }
+        if (!tfPanelOk(panel, vh)) {
+            // 最后手段：不玩 fixed 了，回到文档流（内容与关闭按钮一定看得见）
+            level = 2;
+            panel.style.position = 'static';
+            panel.style.width = '100%';
+            panel.style.maxHeight = vh + 'px';
+            panel.style.height = 'auto';
+            panel.style.overflowY = 'auto';
+            panel.style.marginLeft = '0px';
+            panel.style.marginTop = '0px';
+        }
+
+        if (level !== tfLastPlaceLevel) {
+            tfLastPlaceLevel = level;
+            const r = panel.getBoundingClientRect();
+            const info = {
+                level: ['正常', '贴满全屏', '回文档流'][level],
+                viewport: vw + 'x' + vh,
+                scale: S,
+                origin: Math.round(origin.x) + ',' + Math.round(origin.y),
+                panel: Math.round(r.left) + ',' + Math.round(r.top) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height),
+            };
+            if (level === 0) tfLog('info', 'ui.place', '浮层定位正常', info);
+            else tfLog('warn', 'ui.place', '浮层定位降级到第 ' + level + ' 档', info);
+        }
+    } catch (e) {
+        try { tfLog('error', 'ui.place', '浮层定位异常: ' + (e && e.message || e)); } catch { /* ignore */ }
+    }
 }
 
 /**
@@ -2298,10 +2422,9 @@ function ensureOrbVisible(win, orb) {
         if (win.getComputedStyle && win.getComputedStyle(orb).display === 'none') return;
         const rect = orb.getBoundingClientRect();
         if (!rect || rect.width === 0 || rect.height === 0) return;
-        const vw = win.innerWidth || 0;
-        const vh = win.innerHeight || 0;
+        const { vw, vh } = tfViewport(win);
         if (rect.left >= 0 && rect.top >= 0 && rect.right <= vw && rect.bottom <= vh) return;
-        const range = orbRange(win);
+        const range = orbRange(win, tfPixelScale(win));
         applyOrbPosition(win, orb, { x: range.maxX, y: range.minY });
         const after = orb.getBoundingClientRect();
         tfLog('warn', 'ui.orb', '悬浮球位置异常，已强制摆到右上角', {
@@ -2350,6 +2473,9 @@ function ensureFloatingUI() {
                 </div>
             </header>
             <div class="tf-panel-body" id="token_flow_panel_body"></div>
+            <footer class="tf-panel-footer">
+                <button class="menu_button tf-footer-close" id="token_flow_panel_close_bottom" type="button">${safeT('关闭')}</button>
+            </footer>
         </section>
     `;
 
@@ -2370,14 +2496,16 @@ function ensureFloatingUI() {
     // 恢复悬浮球位置：比例 -> 当前屏幕安全区内的像素
     // （旧版直接写像素，从宽屏同步到手机时球会被画到屏幕外，真机上就是"消失"）
     if (getSettings().showOrb !== false) {
-        applyOrbPosition(window, orb, readOrbPosition(window));
+        applyOrbPosition(window, orb, readOrbPosition(window, tfPixelScale(window)));
         ensureOrbVisible(window, orb);
     }
     // 横竖屏切换 / 手机地址栏收放都会改变 innerHeight，跟着重新摆一次
     const reclampOrb = () => {
-        if (getSettings().showOrb === false) return;
-        applyOrbPosition(window, orb, readOrbPosition(window));
-        ensureOrbVisible(window, orb);
+        if (getSettings().showOrb !== false) {
+            applyOrbPosition(window, orb, readOrbPosition(window, tfPixelScale(window)));
+            ensureOrbVisible(window, orb);
+        }
+        tfSyncFloatingGeometry();   // 面板/遮罩也跟着重摆
     };
     window.addEventListener('resize', reclampOrb);
     window.addEventListener('orientationchange', reclampOrb);
@@ -2397,24 +2525,17 @@ function ensureFloatingUI() {
     orb.addEventListener('pointerdown', (e) => {
         if (e.button !== 0) return;
         const rect = orb.getBoundingClientRect();
-        // 校准用的 margin 会挪动视觉位置：先把差值折进 left/top 再清零 margin，
-        // 这样拖动过程中 left/top 就是视觉坐标，夹取与松手落盘都不会串位。
-        const mLeft = parseFloat(orb.style.marginLeft) || 0;
-        const mTop = parseFloat(orb.style.marginTop) || 0;
-        if (mLeft || mTop) {
-            orb.style.left = Math.round(rect.left) + 'px';
-            orb.style.top = Math.round(rect.top) + 'px';
-            orb.style.right = 'auto';
-            orb.style.bottom = 'auto';
-            orb.style.marginLeft = '0px';
-            orb.style.marginTop = '0px';
-        }
+        // 拖动时只在视觉坐标里算，写回去要减掉包含块原点、再除掉 px 缩放系数
+        const dragOrigin = tfMeasureOrigin(orb) || { x: 0, y: 0 };
         orbDragState = {
             pointerId: e.pointerId,
             startX: e.clientX,
             startY: e.clientY,
             originX: rect.left,
             originY: rect.top,
+            cbX: dragOrigin.x,
+            cbY: dragOrigin.y,
+            scale: tfPixelScale(window),
             range: orbRange(window),   // 拖动中地址栏收放会改视口，先锁一份
             moved: false,
         };
@@ -2433,6 +2554,11 @@ function ensureFloatingUI() {
         const range = orbDragState.range || orbRange(window);
         x = Math.max(range.minX, Math.min(range.maxX, x));
         y = Math.max(range.minY, Math.min(range.maxY, y));
+        const sc = orbDragState.scale || 1;
+        orb.style.left = Math.round((x - orbDragState.cbX) / sc) + 'px';
+        orb.style.top = Math.round((y - orbDragState.cbY) / sc) + 'px';
+        orb.style.right = 'auto';
+        orb.style.bottom = 'auto';
         orb.style.left = x + 'px';
         orb.style.top = y + 'px';
         orb.style.right = 'auto';
@@ -2458,7 +2584,7 @@ function ensureFloatingUI() {
             orb.style.top = Math.round(y) + 'px';
             orb.style.right = 'auto';
             orb.style.bottom = 'auto';
-            saveOrbPosition(window, x, y);
+            saveOrbPosition(window, x, y, drag.scale || 1);
             ensureOrbVisible(window, orb);
             orbSuppressClick = true;
             setTimeout(() => { orbSuppressClick = false; }, 260);
@@ -2482,6 +2608,13 @@ function ensureFloatingUI() {
         orb.classList.remove('is-open');
     });
     scrim.addEventListener('click', () => {
+        panel.style.display = 'none';
+        scrim.style.display = 'none';
+        orb.classList.remove('is-open');
+    });
+    // 底部关闭按钮：表头被顶出屏幕时的唯一出路，必须能点
+    const closeBottom = document.getElementById('token_flow_panel_close_bottom');
+    if (closeBottom) closeBottom.addEventListener('click', () => {
         panel.style.display = 'none';
         scrim.style.display = 'none';
         orb.classList.remove('is-open');
@@ -3109,7 +3242,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.7.5';
+const TF_VERSION = '2.8.0';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
