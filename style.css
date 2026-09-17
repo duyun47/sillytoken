@@ -1675,7 +1675,7 @@
 @media (max-width: 768px) {
     .tf-orb {
         right: 14px;
-        bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+        bottom: calc(96px + env(safe-area-inset-bottom, 0px));
     }
 }
 
@@ -1784,3 +1784,79 @@
 }
 /* 角标显示的是「今日」还是「累计」—— 给调试和测试留个钩子 */
 .tf-orb-badge[data-scope="total"] { opacity: 0.94; }
+
+/* ============================================================
+ *  v2.7.4 · 手机端两处硬伤
+ *
+ *  ① 窄屏下面板头部的 7 个按钮摆不下，把 ✕ 挤出了面板右边缘；
+ *     面板又是 overflow:hidden，于是关闭按钮被裁掉 —— 真机上"打开了关不掉"。
+ *     实测 390px 视口：面板 right 375，关闭按钮 right 397（超出 22px）。
+ *  ② 面板高度原来只有一条 max-height: min(82vh, 640px)。
+ *     万一引擎不支持 min()，整条声明会被丢掉 → 没有任何高度上限 →
+ *     面板比屏幕还高，居中后表头（含关闭按钮）被顶到屏幕上方。
+ *     这里补三级兜底：82vh → min(82vh,640px) → min(82dvh,640px)。
+ * ============================================================ */
+.tf-panel {
+    max-height: 82vh;
+    max-height: min(82vh, 640px);
+    max-height: min(82dvh, 640px);
+}
+/* flex 子项默认 min-height:auto，内容高时会把父容器顶破 —— 显式归零才压得住 */
+.tf-panel-body {
+    min-height: 0;
+}
+/* 表头允许换行 + 允许收缩：宁可换到第二行，也不能把关闭按钮推出屏幕 */
+.tf-panel-header {
+    flex-wrap: wrap;
+    row-gap: 8px;
+    padding: 12px 14px;
+}
+.tf-panel-title {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+}
+.tf-panel-title b,
+.tf-panel-title span {
+    white-space: nowrap;
+}
+.tf-panel-header-right {
+    flex: 1 1 auto;
+    min-width: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+}
+.tf-panel-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+/* 窄屏：改成从底部升起的面板。
+   bottom:0 + top:auto + transform:none 是"结构上的保证"——
+   高度被 max-height 限住，表头就永远在屏幕内，不会再被顶出去。 */
+@media (max-width: 560px) {
+    .tf-panel {
+        top: auto;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        transform: none;
+        width: 100%;
+        max-width: 100%;
+        border-radius: 16px 16px 0 0;
+        max-height: 84vh;
+        max-height: min(84vh, 640px);
+        max-height: min(84dvh, 640px);
+    }
+    .tf-panel-title span { display: none; }
+    .tf-panel-actions .menu_button,
+    .tf-theme-switch-btn {
+        min-width: 30px;
+        padding: 5px 6px;
+        font-size: 13px;
+    }
+    .tf-panel-body {
+        padding: 14px 12px calc(14px + env(safe-area-inset-bottom, 0px));
+    }
+}

@@ -2130,52 +2130,66 @@ function resetSessionStats() {
 
 const ORB_SIZE = 56;
 const ORB_MARGIN = 16;        // 球离屏幕边缘至少留这么多（右上角还有价格角标要放）
+const ORB_BOTTOM_INSET = 96;  // 窄屏底部要避开酒馆输入栏 + 系统手势条
 const ORB_SNAP_RANGE = 24;    // 松手时离边这么近才吸附，否则停在你放的位置
 let orbDragState = null;
 let orbSuppressClick = false;
 
-/** 球可以摆放的范围（视口减去球本身），至少 1 以免除零 */
-function orbMaxOffset(win) {
-    return {
-        x: Math.max(1, (win.innerWidth || 0) - ORB_SIZE),
-        y: Math.max(1, (win.innerHeight || 0) - ORB_SIZE),
-    };
-}
-
 const orbClamp01 = (v) => Math.min(1, Math.max(0, v));
 
 /**
- * 读回悬浮球位置，返回当前屏幕上的像素坐标。
+ * 悬浮球可以待的「安全区」。
  *
- * 存的是占可用空间的比例（fx/fy ∈ 0~1），这样 PC 和手机各按自己的屏幕还原，
- * 不会出现「电脑上拖到右边、手机上跑到屏幕外」。旧数据是像素 { x, y }：
- * 用当前视口折算一次再夹到 0~1 —— 折算结果和旧版在同一屏幕上完全一致，
- * 换到窄屏则被拉回边内（而不是丢在屏幕外）。
+ * 不能直接拿整个视口算：手机底部是酒馆的输入栏加系统手势条，
+ * 按视口底边摆过去的球正好被它们盖住。而位置是按比例跨设备同步的 ——
+ * 在电脑上把球拖到底部（fy≈1），到手机上就贴着视口底边 = 看不见。
+ * 所以底部预留一段，比例映射到这个区间里。
+ */
+function orbRange(win) {
+    const vw = win.innerWidth || 0;
+    const vh = win.innerHeight || 0;
+    const insBottom = vw <= 768 ? ORB_BOTTOM_INSET : ORB_MARGIN;
+    const minX = ORB_MARGIN;
+    const minY = ORB_MARGIN;
+    const maxX = Math.max(minX, vw - ORB_SIZE - ORB_MARGIN);
+    const maxY = Math.max(minY, vh - ORB_SIZE - insBottom);
+    return { minX, minY, maxX, maxY, spanX: Math.max(1, maxX - minX), spanY: Math.max(1, maxY - minY) };
+}
+
+/**
+ * 读回悬浮球位置，返回当前屏幕安全区内的像素坐标。
+ *
+ * 存的是占安全区的比例（fx/fy ∈ 0~1），这样 PC 和手机各按自己的屏幕还原。
+ * 旧数据是像素 { x, y }：用当前视口折算一次再夹到 0~1 —— 同一屏幕上结果完全一致，
+ * 换到窄屏则被拉进安全区（而不是丢在屏幕外或底栏后面）。
  */
 function readOrbPosition(win) {
     let stored = null;
     try { stored = getSettings().orbPosition; } catch { return null; }
     if (!stored || typeof stored !== 'object') return null;
 
-    const max = orbMaxOffset(win);
+    const range = orbRange(win);
     const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
 
     let fx = num(stored.fx);
     if (fx === null) {
         const legacyX = num(stored.x);
         if (legacyX === null) return null;   // 脏数据：交回 CSS 默认位置
-        fx = legacyX / max.x;
+        fx = (legacyX - range.minX) / range.spanX;
     }
 
     let fy = num(stored.fy);
     if (fy === null) {
         const legacyY = num(stored.y);
-        fy = legacyY === null ? null : legacyY / max.y;
+        fy = legacyY === null ? null : (legacyY - range.minY) / range.spanY;
     }
 
     fx = orbClamp01(fx);
     if (fy !== null) fy = orbClamp01(fy);
-    return { x: fx * max.x, y: fy === null ? null : fy * max.y };
+    return {
+        x: range.minX + fx * range.spanX,
+        y: fy === null ? null : range.minY + fy * range.spanY,
+    };
 }
 
 function applyOrbPosition(win, orb, pos) {
@@ -2190,10 +2204,41 @@ function applyOrbPosition(win, orb, pos) {
 
 /** 松手后落盘：写比例，不写像素 */
 function saveOrbPosition(win, x, y) {
-    const max = orbMaxOffset(win);
+    const range = orbRange(win);
     const s = getSettings();
-    s.orbPosition = { fx: orbClamp01(x / max.x), fy: orbClamp01(y / max.y) };
+    s.orbPosition = {
+        fx: orbClamp01((x - range.minX) / range.spanX),
+        fy: orbClamp01((y - range.minY) / range.spanY),
+    };
     saveSettingsDebounced();
+}
+
+/**
+ * 兜底：摆完之后球必须在视口里。
+ *
+ * 比例映射理论上不会算出屏幕外，但真机上有过"球不见了"，
+ * 而用户设备上没有 DevTools 可以查。所以实测一次，越界就退回 CSS 默认角落，
+ * 并把现场写进运行日志 —— 至少能留证。
+ */
+function ensureOrbVisible(win, orb) {
+    try {
+        if (!orb || !orb.getBoundingClientRect) return;
+        if (win.getComputedStyle && win.getComputedStyle(orb).display === 'none') return;
+        const rect = orb.getBoundingClientRect();
+        if (!rect || rect.width === 0 || rect.height === 0) return;
+        const vw = win.innerWidth || 0;
+        const vh = win.innerHeight || 0;
+        if (rect.left >= 0 && rect.top >= 0 && rect.right <= vw && rect.bottom <= vh) return;
+        orb.style.left = '';
+        orb.style.top = '';
+        orb.style.right = '';
+        orb.style.bottom = '';
+        tfLog('warn', 'ui.orb', '悬浮球位置超出视口，已退回默认角落', {
+            left: Math.round(rect.left), top: Math.round(rect.top),
+            right: Math.round(rect.right), bottom: Math.round(rect.bottom),
+            viewport: vw + 'x' + vh,
+        });
+    } catch { /* ignore */ }
 }
 
 function ensureFloatingUI() {
@@ -2245,13 +2290,31 @@ function ensureFloatingUI() {
     const refreshBtn = document.getElementById('token_flow_manual_refresh') || document.getElementById('token_flow_refresh');
     const resetBtn = document.getElementById('token_flow_reset_session');
 
-    // 恢复悬浮球位置：比例 -> 当前屏幕像素，天然不会落到屏幕外
+    // 恢复悬浮球位置：比例 -> 当前屏幕安全区内的像素
     // （旧版直接写像素，从宽屏同步到手机时球会被画到屏幕外，真机上就是"消失"）
-    applyOrbPosition(window, orb, readOrbPosition(window));
+    if (getSettings().showOrb !== false) {
+        applyOrbPosition(window, orb, readOrbPosition(window));
+        ensureOrbVisible(window, orb);
+    }
     // 横竖屏切换 / 手机地址栏收放都会改变 innerHeight，跟着重新摆一次
-    const reclampOrb = () => applyOrbPosition(window, orb, readOrbPosition(window));
+    const reclampOrb = () => {
+        if (getSettings().showOrb === false) return;
+        applyOrbPosition(window, orb, readOrbPosition(window));
+        ensureOrbVisible(window, orb);
+    };
     window.addEventListener('resize', reclampOrb);
     window.addEventListener('orientationchange', reclampOrb);
+
+    // 留证据：真机上"看不见悬浮球"时，运行日志里能看出它被摆到哪儿了
+    try {
+        const ob = orb.getBoundingClientRect();
+        tfLog('info', 'ui.orb', '悬浮球就绪', {
+            left: Math.round(ob.left), top: Math.round(ob.top),
+            viewport: window.innerWidth + 'x' + window.innerHeight,
+            showOrb: getSettings().showOrb !== false,
+            stored: getSettings().orbPosition ? 'yes' : 'none',
+        });
+    } catch { /* ignore */ }
 
     // 拖动逻辑
     orb.addEventListener('pointerdown', (e) => {
@@ -2263,6 +2326,7 @@ function ensureFloatingUI() {
             startY: e.clientY,
             originX: rect.left,
             originY: rect.top,
+            range: orbRange(window),   // 拖动中地址栏收放会改视口，先锁一份
             moved: false,
         };
         orb.setPointerCapture?.(e.pointerId);
@@ -2276,8 +2340,10 @@ function ensureFloatingUI() {
         if (!orbDragState.moved) return;
         let x = orbDragState.originX + dx;
         let y = orbDragState.originY + dy;
-        x = Math.max(8, Math.min(window.innerWidth - ORB_SIZE - 8, x));
-        y = Math.max(8, Math.min(window.innerHeight - ORB_SIZE - 8, y));
+        // 夹在安全区里：窄屏底部要给酒馆输入栏留位置，别让球被拖到底栏后面去
+        const range = orbDragState.range || orbRange(window);
+        x = Math.max(range.minX, Math.min(range.maxX, x));
+        y = Math.max(range.minY, Math.min(range.maxY, y));
         orb.style.left = x + 'px';
         orb.style.top = y + 'px';
         orb.style.right = 'auto';
@@ -2292,17 +2358,19 @@ function ensureFloatingUI() {
         orbDragState = null;
         if (drag.moved) {
             const rect = orb.getBoundingClientRect();
-            // 只有松手时贴着边（<=24px）才吸附，其余位置就停在你放的地方。
-            // 旧版无条件吸到左/右 12px，于是球永远只能在两条边上，用户反馈"没法自由移动"。
+            // 只在「贴着边」时才吸附；拖到中间就停在中间（旧版无条件吸边，
+            // 于是球永远只能待在左右两条边上，用户反馈"没法自由移动"）
+            const range = orbRange(window);
             let x = rect.left;
-            if (x <= ORB_SNAP_RANGE) x = ORB_MARGIN;
-            else if (x >= window.innerWidth - ORB_SIZE - ORB_SNAP_RANGE) x = window.innerWidth - ORB_SIZE - ORB_MARGIN;
-            const y = Math.max(ORB_MARGIN, Math.min(window.innerHeight - ORB_SIZE - ORB_MARGIN, rect.top));
+            if (x <= range.minX + ORB_SNAP_RANGE) x = range.minX;
+            else if (x >= range.maxX - ORB_SNAP_RANGE) x = range.maxX;
+            const y = Math.max(range.minY, Math.min(range.maxY, rect.top));
             orb.style.left = Math.round(x) + 'px';
             orb.style.top = Math.round(y) + 'px';
             orb.style.right = 'auto';
             orb.style.bottom = 'auto';
             saveOrbPosition(window, x, y);
+            ensureOrbVisible(window, orb);
             orbSuppressClick = true;
             setTimeout(() => { orbSuppressClick = false; }, 260);
         }
@@ -2546,6 +2614,11 @@ function addExtensionSettingsInto(content) {
     sw4Input.addEventListener('change', () => {
         const orbe = document.getElementById('token_flow_orb');
         if (orbe) orbe.style.display = sw4Input.checked ? '' : 'none';
+        // 启动时这个开关如果是关的，悬浮球压根没被创建 —— 只把它 display 回来是不够的
+        // （旧版就是这样：打开了开关却没反应，得重启酒馆）
+        if (sw4Input.checked && !orbe) {
+            try { ensureFloatingUI(); } catch (e) { tfLog('error', 'ui.orb', '补建悬浮球失败: ' + (e && e.message || e)); }
+        }
         updateOrbBadge();   // 关掉再打开时，角标状态要跟着回来
     });
 
@@ -2947,7 +3020,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.7.3';
+const TF_VERSION = '2.7.4';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
