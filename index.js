@@ -2098,6 +2098,7 @@ function safeUpdateUI() {
         }
         try {
             updateDashboard();
+            tfSyncFloatingGeometry();   // 视口变了/刚打开：把面板与遮罩摆正
         } catch (error) {
             tfLog('error', 'ui.render', '面板渲染失败: ' + (error?.message || error));
         }
@@ -2138,6 +2139,36 @@ let orbSuppressClick = false;
 const orbClamp01 = (v) => Math.min(1, Math.max(0, v));
 
 /**
+ * 把「position:fixed 的包含块被祖先劫持」这个坑补回来。
+ *
+ * 荣耀手机的 Edge 里，酒馆移动端布局会给 body 加 transform（GPU 合成），
+ * 于是 body 成了 position:fixed 的包含块；而 body 在文档流里高度是 0
+ * （移动端元素几乎全是 fixed）—— 所有 fixed 元素都不再相对视口定位：
+ *   bottom:96px 变成「页面顶部往上 96px」→ 球直接看不见
+ *   top:50%     变成 0                      → 面板上半截在屏幕外
+ *   inset:0     变成 0 高                   → 遮罩等于没铺
+ * （真机日志实测：viewport 732x1333 时球落在 top -152 / bottom -96，与本地复现一致）
+ *
+ * 第一道防线是挂到 <html> 上（绕开 body 这个包含块）；这里是第二道：
+ * 摆完实测一次，把差值用 margin 补回来 —— margin 只挪位置、不干扰 transform，
+ * 而且不管包含块是谁，这个差值都能测出来。
+ */
+function tfFixContainingBlock(win, el, wantLeft, wantTop) {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+    el.style.marginLeft = '0px';
+    el.style.marginTop = '0px';
+    const rect = el.getBoundingClientRect();
+    if (!rect || (rect.width === 0 && rect.height === 0)) return null;
+    const dx = Math.round(wantLeft - rect.left);
+    const dy = Math.round(wantTop - rect.top);
+    if (dx || dy) {
+        el.style.marginLeft = dx + 'px';
+        el.style.marginTop = dy + 'px';
+    }
+    return { dx, dy };
+}
+
+/**
  * 悬浮球可以待的「安全区」。
  *
  * 不能直接拿整个视口算：手机底部是酒馆的输入栏加系统手势条，
@@ -2164,42 +2195,46 @@ function orbRange(win) {
  * 换到窄屏则被拉进安全区（而不是丢在屏幕外或底栏后面）。
  */
 function readOrbPosition(win) {
-    let stored = null;
-    try { stored = getSettings().orbPosition; } catch { return null; }
-    if (!stored || typeof stored !== 'object') return null;
-
     const range = orbRange(win);
+    // 没存过位置 / 数据是脏的 → 用默认角落（右下，安全区内），
+    // 不能返回 null：摆完要实测校准，得有一个明确的预期坐标
+    const fallback = { x: range.maxX, y: range.maxY };
+    let stored = null;
+    try { stored = getSettings().orbPosition; } catch { return fallback; }
+    if (!stored || typeof stored !== 'object') return fallback;
+
     const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
 
     let fx = num(stored.fx);
     if (fx === null) {
         const legacyX = num(stored.x);
-        if (legacyX === null) return null;   // 脏数据：交回 CSS 默认位置
+        if (legacyX === null) return fallback;   // 脏数据：回默认角落
         fx = (legacyX - range.minX) / range.spanX;
     }
 
     let fy = num(stored.fy);
     if (fy === null) {
         const legacyY = num(stored.y);
-        fy = legacyY === null ? null : (legacyY - range.minY) / range.spanY;
+        if (legacyY === null) return fallback;
+        fy = (legacyY - range.minY) / range.spanY;
     }
 
     fx = orbClamp01(fx);
-    if (fy !== null) fy = orbClamp01(fy);
+    fy = orbClamp01(fy);
     return {
         x: range.minX + fx * range.spanX,
-        y: fy === null ? null : range.minY + fy * range.spanY,
+        y: range.minY + fy * range.spanY,
     };
 }
 
 function applyOrbPosition(win, orb, pos) {
     if (!pos) return;
     orb.style.left = Math.round(pos.x) + 'px';
+    orb.style.top = Math.round(pos.y) + 'px';
     orb.style.right = 'auto';
-    if (pos.y !== null) {
-        orb.style.top = Math.round(pos.y) + 'px';
-        orb.style.bottom = 'auto';
-    }
+    orb.style.bottom = 'auto';
+    // 摆完实测一次：包含块被劫持的浏览器里，实际位置会和预期差一大截
+    tfFixContainingBlock(win, orb, pos.x, pos.y);
 }
 
 /** 松手后落盘：写比例，不写像素 */
@@ -2214,11 +2249,48 @@ function saveOrbPosition(win, x, y) {
 }
 
 /**
+ * 面板 + 遮罩的几何校准（每次渲染后、视口变化后调用）。
+ *
+ * CSS 里面板是「居中」或「贴底」，遮罩是 inset:0 —— 这些在包含块被劫持的
+ * 浏览器里全都会算错：面板上半截出屏、遮罩缩成 0 高一条。
+ * 这里按视口算出预期位置，再用实测差值补回来。
+ */
+function tfSyncFloatingGeometry() {
+    try {
+        const win = window;
+        const vw = win.innerWidth || 0;
+        const vh = win.innerHeight || 0;
+        if (!vw || !vh) return;
+
+        const scrim = document.getElementById('token_flow_panel_scrim');
+        if (scrim && scrim.style.display !== 'none') {
+            scrim.style.left = '0px';
+            scrim.style.top = '0px';
+            scrim.style.right = 'auto';
+            scrim.style.bottom = 'auto';
+            scrim.style.width = vw + 'px';
+            scrim.style.height = vh + 'px';
+            tfFixContainingBlock(win, scrim, 0, 0);
+        }
+
+        const panel = document.getElementById('token_flow_panel');
+        if (panel && panel.style.display !== 'none') {
+            const rect = panel.getBoundingClientRect();
+            if (rect && rect.width > 0) {
+                // 窄屏是贴底的面板，宽屏是居中
+                const wantLeft = Math.round((vw - rect.width) / 2);
+                const wantTop = vw <= 560 ? Math.round(vh - rect.height) : Math.round((vh - rect.height) / 2);
+                tfFixContainingBlock(win, panel, wantLeft, wantTop);
+            }
+        }
+    } catch { /* ignore */ }
+}
+
+/**
  * 兜底：摆完之后球必须在视口里。
  *
- * 比例映射理论上不会算出屏幕外，但真机上有过"球不见了"，
- * 而用户设备上没有 DevTools 可以查。所以实测一次，越界就退回 CSS 默认角落，
- * 并把现场写进运行日志 —— 至少能留证。
+ * 实测一次；不在就**强制摆到右上角**（不是清掉内联样式 —— 那样只会退回同一套
+ * 算错的 CSS 默认位置，等于没救）。现场写进运行日志，真机出问题能留证。
  */
 function ensureOrbVisible(win, orb) {
     try {
@@ -2229,13 +2301,13 @@ function ensureOrbVisible(win, orb) {
         const vw = win.innerWidth || 0;
         const vh = win.innerHeight || 0;
         if (rect.left >= 0 && rect.top >= 0 && rect.right <= vw && rect.bottom <= vh) return;
-        orb.style.left = '';
-        orb.style.top = '';
-        orb.style.right = '';
-        orb.style.bottom = '';
-        tfLog('warn', 'ui.orb', '悬浮球位置超出视口，已退回默认角落', {
+        const range = orbRange(win);
+        applyOrbPosition(win, orb, { x: range.maxX, y: range.minY });
+        const after = orb.getBoundingClientRect();
+        tfLog('warn', 'ui.orb', '悬浮球位置异常，已强制摆到右上角', {
             left: Math.round(rect.left), top: Math.round(rect.top),
             right: Math.round(rect.right), bottom: Math.round(rect.bottom),
+            fixedTo: Math.round(after.left) + ',' + Math.round(after.top),
             viewport: vw + 'x' + vh,
         });
     } catch { /* ignore */ }
@@ -2281,7 +2353,12 @@ function ensureFloatingUI() {
         </section>
     `;
 
-    document.body.appendChild(fragment);
+    // 挂到 <html> 而不是 <body>：body 一旦被加了 transform（手机浏览器为 GPU 合成
+    // 很常见），它就变成 position:fixed 的包含块；而移动端 body 的文档流高度是 0，
+    // 于是所有 fixed 元素都被摆到「页面顶部那个 0 高度盒子」上 ——
+    // 悬浮球 bottom:96px 会跑到屏幕上方、面板 top:50% 会变成 0（上半截出屏）。
+    // 挂在 body 外面就绕开了这个包含块。
+    (document.documentElement || document.body).appendChild(fragment);
 
     const orb = document.getElementById('token_flow_orb');
     const panel = document.getElementById('token_flow_panel');
@@ -2320,6 +2397,18 @@ function ensureFloatingUI() {
     orb.addEventListener('pointerdown', (e) => {
         if (e.button !== 0) return;
         const rect = orb.getBoundingClientRect();
+        // 校准用的 margin 会挪动视觉位置：先把差值折进 left/top 再清零 margin，
+        // 这样拖动过程中 left/top 就是视觉坐标，夹取与松手落盘都不会串位。
+        const mLeft = parseFloat(orb.style.marginLeft) || 0;
+        const mTop = parseFloat(orb.style.marginTop) || 0;
+        if (mLeft || mTop) {
+            orb.style.left = Math.round(rect.left) + 'px';
+            orb.style.top = Math.round(rect.top) + 'px';
+            orb.style.right = 'auto';
+            orb.style.bottom = 'auto';
+            orb.style.marginLeft = '0px';
+            orb.style.marginTop = '0px';
+        }
         orbDragState = {
             pointerId: e.pointerId,
             startX: e.clientX,
@@ -3020,7 +3109,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.7.4';
+const TF_VERSION = '2.7.5';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
