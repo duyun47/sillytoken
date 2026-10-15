@@ -2113,7 +2113,7 @@ function quotaRingHTML(pct, used, limit, label, mode, s) {
             <div class="tf-ring-meta">
                 <div class="tf-ring-label">${tfEscapeHtml(label)}</div>
                 <div class="tf-ring-desc">${tfEscapeHtml(usedStr)}</div>
-                <div class="tf-ring-reset">🔄 ${safeT('重置')} · ${tfEscapeHtml(fmtClock(s, mode))}</div>
+                <div class="tf-ring-reset">🔄 ${safeT('重置')} · ${mode === 'daily' ? '00:00' : tfEscapeHtml(fmtClock(s, mode))}</div>
             </div>
         </div>`;
 }
@@ -3486,7 +3486,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.9.7';
+const TF_VERSION = '2.9.8';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
@@ -5125,6 +5125,7 @@ function tfRenderChart(container, s, stats) {
 }
 
 let tfPatchDraftOpen = false;
+let tfPatchListOpen = false;   // v2.9.8：渠道子页补丁清单默认收起
 
 /** 汇总四层记账里见过的所有口径（key → 请求次数/token），供「口径速配」展示 */function tfCollectSeenSourceKeys(s) {
     const seen = new Map();
@@ -5158,10 +5159,14 @@ function renderPatchList(container, s) {
     if (!list.length) return;
     const box = document.createElement('div');
     box.className = 'tf-seen';
-    const head = document.createElement('div');
-    head.className = 'tf-pending-head';
-    head.textContent = safeT('已有的归组补丁（单日/区间）') + '（' + list.length + '）';
+    // v2.9.8：补丁多了之后一长串太占地方 —— 默认收起，点标题展开/收起
+    const head = document.createElement('button');
+    head.type = 'button';
+    head.className = 'tf-pending-head tf-collapse-head';
+    head.textContent = (tfPatchListOpen ? '▾ ' : '▸ ') + safeT('已有的归组补丁（单日/区间）') + '（' + list.length + '）';
+    head.addEventListener('click', () => { tfPatchListOpen = !tfPatchListOpen; safeUpdateUI(); });
     box.appendChild(head);
+    if (!tfPatchListOpen) { container.appendChild(box); return; }
     for (const p of list) {
         const row = document.createElement('div');
         row.className = 'tf-seen-row';

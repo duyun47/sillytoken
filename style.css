@@ -2288,3 +2288,17 @@
 .tf-seen-row .tf-origin-inp {
     flex: 1 1 120px;
 }
+
+/* ---------- v2.9.8 折叠标题（补丁清单等） ---------- */
+.tf-collapse-head {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    padding: 2px 0;
+    font-weight: 600;
+    min-height: 36px;
+}
