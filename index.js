@@ -1004,6 +1004,13 @@ function acquireCapture(payload, url, win, claimable) {
             //     把自己那条晾着，结果一样是重复记账。
             const chosen = exact || candidates[0];
             chosen.claimed = true;
+            // v2.9.6：宿主层待认领记录没有来源标记（generateRaw 的参数里不带 API 标记），
+            // 但内层这层看得到真实 payload —— 认领时把来源补进被认领的记录。
+            // 旧版在这一步把来源弄丢，导致这类请求被归进「未知（旧记录）」。
+            if (!chosen.source) {
+                const inner = tfSourceKeyOf(payload);
+                if (inner) chosen.source = inner;
+            }
             tfLog('info', 'capture.claim', '内层网络层认领了宿主层的待认领记录', {
                 layer: String(url || '').slice(0, 60),
                 candidates: candidates.length,
@@ -1055,6 +1062,8 @@ function finishCapture(capture, options = {}) {
         CAPTURE_STATS.recorded += 1;
         tfLog('info', 'capture.recorded', capture.model, {
             layer: capture.url,
+            // v2.9.6：把口径打进日志 —— 排查「为什么这条归类不对」不用再猜
+            source: capture.source || '（无标记）',
             in: options.usage.in,
             out: options.usage.out,
             cached: options.usage.cached,
@@ -1081,6 +1090,7 @@ function finishCapture(capture, options = {}) {
             CAPTURE_STATS.estimated += 1;
             tfLog('warn', 'capture.estimated', capture.model, {
                 layer: capture.url, reason, in: inTok, out: outTok,
+                source: capture.source || '（无标记）',
                 usd: cost ? Number((cost.usd || 0).toFixed(6)) : 0,
             });
             prunePendingCaptures();
@@ -3361,7 +3371,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.9.5';
+const TF_VERSION = '2.9.6';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
