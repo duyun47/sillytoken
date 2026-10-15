@@ -938,22 +938,32 @@ function pickModelFor(payload, win) {
 /**
  * v2.9.0 渠道：从请求体提取「这笔消费从哪个口子走」。
  * 依据 SillyTavern release 源码：generate_data 每笔都带 chat_completion_source，
- * 选「自定义(兼容 OpenAI)」时还带 custom_url（实际转口地址）。
- * 只存「来源类型」或「custom + 地址 origin」；请求体里的凭据类字段
- * （如 reverse_proxy 的 proxy_password）一律不读不存。
+ * 选「自定义(兼容 OpenAI)」时还带 custom_url（实际转口地址）；
+ * 官方类源挂了反向代理时带 reverse_proxy（v2.9.1 起记录其 origin，
+ * 这样「官方协议 + 中转」与官方直连也能分开）。
+ * 只存「来源类型」「custom + 地址 origin」「proxy + 反代 origin」；
+ * 请求体里的凭据类字段（如 reverse_proxy 的 proxy_password）一律不读不存。
  * 拿不到标记（如旧路径 / generateRaw 宿主函数）返回 null，界面上归「未归类」，
  * 老数据的天级补丁只作用于这种「没有来源」的记录。
  */
+function tfOriginOf(rawUrl) {
+    try { return new URL(String(rawUrl).trim()).origin; }
+    catch { return String(rawUrl).trim().split('/')[0] || String(rawUrl).trim(); }
+}
+
 function tfSourceKeyOf(payload) {
     try {
         if (!payload || typeof payload !== 'object') return null;
         const src = String(payload.chat_completion_source || '').trim();
+        // 反代优先：挂着 reverse_proxy 时，真正接钱的是中转而非官方直连。
+        // 只取 origin——不存路径，也不读 proxy_password。
+        const rp = String(payload.reverse_proxy || '').trim();
+        if (rp) return 'proxy:' + tfOriginOf(rp);
         if (!src) return null;
         if (src === 'custom') {
             const raw = String(payload.custom_url || '').trim();
             if (!raw) return 'custom';
-            try { return 'custom:' + new URL(raw).origin; }
-            catch { return 'custom:' + (raw.split('/')[0] || raw); }
+            return 'custom:' + tfOriginOf(raw);
         }
         return src;
     } catch { return null; }
@@ -3599,6 +3609,8 @@ const TF_SOURCE_OPTIONS = [
     { v: 'mistralai', label: 'Mistral' },
     { v: 'xai', label: 'xAI' },
     { v: 'groq', label: 'Groq' },
+    // v2.9.1：官方协议 + 反向代理（公益站常见接法）—— 按反代地址的 origin 分辨
+    { v: 'proxy', label: '反代地址（官方协议走中转）' },
 ];
 
 // 系统预填的官方渠道（可改可删）
@@ -4058,16 +4070,28 @@ function renderChannelsSub(container, s) {
                     opt.textContent = o.label;
                     sel.appendChild(opt);
                 }
-                const customVal = src.startsWith('custom:') ? src.slice(7) : '';
-                sel.value = src.startsWith('custom:') ? 'custom' : (tfSourceOptions().some((o) => o.v === src) ? src : 'makersuite');
+                // 口径两种带地址前缀：custom:（自定义源地址）/ proxy:（反代地址）
+                const pre = src.startsWith('custom:') ? 'custom' : (src.startsWith('proxy:') ? 'proxy' : null);
+                const addrVal = pre ? src.slice(pre.length + 1) : '';
+                sel.value = pre || (tfSourceOptions().some((o) => o.v === src) ? src : 'makersuite');
                 const urlInp = document.createElement('input');
                 urlInp.type = 'text';
                 urlInp.className = 'text_pole tf-origin-inp';
                 urlInp.placeholder = safeT('转口地址，如 https://api.example.com');
-                urlInp.value = customVal;
-                urlInp.style.display = sel.value === 'custom' ? '' : 'none';
-                const syncSrc = () => { cur[k] = sel.value === 'custom' ? 'custom:' + String(urlInp.value).trim() : sel.value; };
-                sel.addEventListener('change', () => { syncSrc(); urlInp.style.display = sel.value === 'custom' ? '' : 'none'; });
+                urlInp.value = addrVal;
+                urlInp.style.display = pre ? '' : 'none';
+                const syncSrc = () => {
+                    cur[k] = sel.value === 'proxy'
+                        ? 'proxy:' + String(urlInp.value).trim()
+                        : (sel.value === 'custom' ? 'custom:' + String(urlInp.value).trim() : sel.value);
+                };
+                sel.addEventListener('change', () => {
+                    const showAddr = sel.value === 'custom' || sel.value === 'proxy';
+                    urlInp.style.display = showAddr ? '' : 'none';
+                    if (sel.value === 'proxy') cur[k] = 'proxy:' + String(urlInp.value).trim();
+                    else if (sel.value === 'custom') cur[k] = 'custom:' + String(urlInp.value).trim();
+                    else cur[k] = sel.value;
+                });
                 urlInp.addEventListener('change', syncSrc);
                 const delBtn = document.createElement('button');
                 delBtn.type = 'button';
@@ -4110,7 +4134,9 @@ function renderChannelsSub(container, s) {
 }
 
 function tfSourceLabel(src) {
-    if (String(src).startsWith('custom:')) return safeT('转口') + ' ' + String(src).slice(7);
+    src = String(src);
+    if (src.startsWith('custom:')) return safeT('转口') + ' ' + src.slice(7);
+    if (src.startsWith('proxy:')) return safeT('反代') + ' ' + src.slice(6);
     const o = tfSourceOptions().find((x) => x.v === src);
     return o ? o.label : String(src);
 }
@@ -4503,8 +4529,22 @@ function tfAggregateRange(s, range) {
             return;
         }
         const patch = dayDate ? patchesByDate.get(String(dayDate)) : null;
-        if (patch && (!patch.pattern || String(name || '').toLowerCase().startsWith(String(patch.pattern).toLowerCase()))) {
+        // v2.9.1 修复：按「归一化后的模型名」匹配补丁前缀。
+        // 酒馆发上来的名字常带装饰（假流式- / [NV] / vendor/ / -preview 等），
+        // 直接 startsWith 会漏掉 「假流式-gemini-3.1-pro-preview」 这类；
+        // 归一化剥掉装饰后是 gemini-3.1-pro，和用户填的 「gemini」 正常命中。
+        // 旧的原始名前缀匹配保留为兜底（两个都中才算？不——任一命中即归组）。
+        const pat = String(patch.pattern || '').trim().toLowerCase();
+        if (patch && !pat) {
             pushChannel(patch.channel, entry);
+        } else if (patch) {
+            const canon = tfCanonicalModel(String(name || ''));
+            const patCanon = tfCanonicalModel(pat);
+            if (canon.startsWith(patCanon) || String(name || '').toLowerCase().startsWith(pat)) {
+                pushChannel(patch.channel, entry);
+            } else {
+                pushChannel(safeT('未知（旧记录）'), entry);
+            }
         } else {
             pushChannel(safeT('未知（旧记录）'), entry);
         }
@@ -4930,7 +4970,7 @@ function renderDayPatchBar(box, s, date) {
 
         const patInp = document.createElement('input');
         patInp.className = 'text_pole tf-origin-inp';
-        patInp.placeholder = safeT('可选：只归指定开头的模型，如 gemini');
+        patInp.placeholder = safeT('可选：只归指定开头的模型（按归一化匹配，假流式- 这类装饰不影响），如 gemini');
         patInp.value = existing ? (existing.pattern || '') : '';
         form.appendChild(patInp);
 
