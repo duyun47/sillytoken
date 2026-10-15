@@ -99,6 +99,13 @@ const defaultSettings = {
     autoRefresh: false,                // 自动刷新
     autoRefreshInterval: 15,           // 自动刷新间隔（秒）
     rpm: { window: [], peak: 0 },      // 每分钟请求数(RPM)滑动窗口
+    // ===== v2.9.0：渠道 + 老数据天级补丁 =====
+    // channels: [{ name, sources: ['makersuite', 'openrouter', 'custom:https://...'], builtin?: true }]
+    // sources 元素 = 酒馆请求体里的 chat_completion_source 取值，或 'custom:' + 转口 origin
+    channels: [],
+    // dayPatches: [{ date: 'YYYY-MM-DD', allModels: true, pattern: '', channel: '渠道名' }]
+    // 仅作用于「没有来源数据的老记录」；有真实来源的记录不受补丁影响
+    dayPatches: [],
 };
 
 function getSettings() {
@@ -298,12 +305,29 @@ function fmtTokens(n) {
  *  数据记录（累计 + 会话双桶）
  * ============================================================ */
 
-function recordUsage(model, inTok, outTok, cachedTok, isEstimate, requests = 1) {
+/** v2.9.0 渠道：把一笔用量按「来源口径」记进模型桶的子表（stats/session/daily 四层口径一致） */
+function tfAccumulateSource(m, sourceKey, inTok, outTok, cachedTok, requests, costUsd, isEstimate, unpriced) {
+    if (!sourceKey || !m) return;
+    if (!m.sources || typeof m.sources !== 'object') m.sources = {};
+    const sub = (typeof m.sources[sourceKey] === 'object' && m.sources[sourceKey])
+        ? m.sources[sourceKey]
+        : (m.sources[sourceKey] = { in: 0, out: 0, cached: 0, req: 0, cost: 0, est: 0, unpriced: 0 });
+    sub.in += inTok || 0;
+    sub.out += outTok || 0;
+    sub.cached += cachedTok || 0;
+    sub.req += requests || 0;
+    sub.cost += costUsd || 0;
+    if (isEstimate) sub.est = (sub.est || 0) + 1;
+    if (unpriced) sub.unpriced = (sub.unpriced || 0) + 1;
+}
+
+function recordUsage(model, inTok, outTok, cachedTok, isEstimate, requests = 1, sourceKey = null) {
     const s = getSettings();
     if (!s.enabled) return;
 
     const key = String(model || 'unknown');
-    let cost = { usd: 0 };
+    const cost = calcCost(s, key, inTok, outTok, cachedTok, requests);
+    const unpricedHit = !!(cost.price && cost.price.matchedBy === 'none');
 
     for (const bucketName of ['stats', 'session']) {
         const bucket = s[bucketName];
@@ -317,10 +341,12 @@ function recordUsage(model, inTok, outTok, cachedTok, isEstimate, requests = 1) 
         m.req += requests;
         if (isEstimate) m.est += 1;
 
-        cost = calcCost(s, key, inTok, outTok, cachedTok, requests);
         m.cost += cost.usd;
-        if (cost.price && cost.price.matchedBy === 'none') m.unpriced = (m.unpriced || 0) + 1;
+        if (unpricedHit) m.unpriced = (m.unpriced || 0) + 1;
         if (cost.price && cost.price.matchedBy === 'fuzzy') m.fuzzyMatched = cost.price.matchedName || '';
+
+        // v2.9.0 渠道分桶：同一模型走不同口子时，费用/用量按口径拆开
+        tfAccumulateSource(m, sourceKey, inTok, outTok, cachedTok, requests, cost.usd, isEstimate, unpricedHit);
 
         bucket.totalTokens = (bucket.totalTokens || 0) + (inTok || 0) + (outTok || 0) + (cachedTok || 0);
         bucket.totalRequests = (bucket.totalRequests || 0) + requests;
@@ -348,6 +374,8 @@ function recordUsage(model, inTok, outTok, cachedTok, isEstimate, requests = 1) 
     dailyModel.cost = (dailyModel.cost || 0) + cost.usd;
     if (isEstimate) dailyModel.est = (dailyModel.est || 0) + 1;
     if (cost.price && cost.price.matchedBy === 'none') dailyModel.unpriced = (dailyModel.unpriced || 0) + 1;
+    // v2.9.0 渠道分桶（今日）：maybeArchive 快照 dailyStats.models 时会连 sources 一起归档
+    tfAccumulateSource(dailyModel, sourceKey, inTok, outTok, cachedTok, requests, cost.usd, isEstimate, unpricedHit);
     checkBudgetAlert(s, cost.usd);
     maybeArchive(s);
 
@@ -907,6 +935,30 @@ function pickModelFor(payload, win) {
     } catch { return 'tavern-helper'; }
 }
 
+/**
+ * v2.9.0 渠道：从请求体提取「这笔消费从哪个口子走」。
+ * 依据 SillyTavern release 源码：generate_data 每笔都带 chat_completion_source，
+ * 选「自定义(兼容 OpenAI)」时还带 custom_url（实际转口地址）。
+ * 只存「来源类型」或「custom + 地址 origin」；请求体里的凭据类字段
+ * （如 reverse_proxy 的 proxy_password）一律不读不存。
+ * 拿不到标记（如旧路径 / generateRaw 宿主函数）返回 null，界面上归「未归类」，
+ * 老数据的天级补丁只作用于这种「没有来源」的记录。
+ */
+function tfSourceKeyOf(payload) {
+    try {
+        if (!payload || typeof payload !== 'object') return null;
+        const src = String(payload.chat_completion_source || '').trim();
+        if (!src) return null;
+        if (src === 'custom') {
+            const raw = String(payload.custom_url || '').trim();
+            if (!raw) return 'custom';
+            try { return 'custom:' + new URL(raw).origin; }
+            catch { return 'custom:' + (raw.split('/')[0] || raw); }
+        }
+        return src;
+    } catch { return null; }
+}
+
 /* ---------- 捕获记录的创建 / 认领 / 结算 ---------- */
 
 let captureSeq = 0;
@@ -957,6 +1009,7 @@ function acquireCapture(payload, url, win, claimable) {
         at: now,
         url: String(url || '').slice(0, 160),
         model: pickModelFor(payload, win),
+        source: tfSourceKeyOf(payload),
         digest,
         messages,
         stream: !!(payload && payload.stream),
@@ -988,7 +1041,7 @@ function finishCapture(capture, options = {}) {
     capture.done = true;
 
     if (options.usage) {
-        const cost = recordUsage(capture.model, options.usage.in, options.usage.out, options.usage.cached, false);
+        const cost = recordUsage(capture.model, options.usage.in, options.usage.out, options.usage.cached, false, 1, capture.source);
         CAPTURE_STATS.recorded += 1;
         tfLog('info', 'capture.recorded', capture.model, {
             layer: capture.url,
@@ -1014,7 +1067,7 @@ function finishCapture(capture, options = {}) {
         const inTok = capture.messages.reduce((sum, m) => sum + estimateTokens(m.text), 0);
         const outTok = estimateTokens(options.outputText || '');
         if (inTok > 0 || outTok > 0) {
-            const cost = recordUsage(capture.model, inTok, outTok, 0, true);
+            const cost = recordUsage(capture.model, inTok, outTok, 0, true, 1, capture.source);
             CAPTURE_STATS.estimated += 1;
             tfLog('warn', 'capture.estimated', capture.model, {
                 layer: capture.url, reason, in: inTok, out: outTok,
@@ -1791,35 +1844,65 @@ function updateDashboard() {
     started.textContent = safeT('会话开始于') + ' ' + d.toLocaleString();
     grid.appendChild(started);
 
+    // v2.9.0：重绘前把滚动位置记下来，重绘后原样放回。
+    // 旧版损失的两种典型场景：点柱子看明细（内容变高）时可视区漂移、
+    // 改设置触发重算时看的地方跳走。面板自身位置由定位冻结保证不移动。
+    const scrollSaved = (el.scrollTop || 0);
     el.innerHTML = '';
-    el.appendChild(grid);
 
-    // 渲染后自检：真机上出现过「概览 6 张卡占着位置、却整块没画出来」，
-    // 而用户设备上没有 DevTools —— 面板变空只能靠猜。这里把现场写进运行日志
-    // （面板底部就能看到、也能复制出来），下次一出问题就有证据可查。
-    if (s.enabled && el && typeof el.querySelectorAll === 'function') {
-        let cardCount = -1;
-        try { cardCount = el.querySelectorAll('.tf-stat-card').length; } catch { cardCount = -1; }
-        if (cardCount >= 0 && cardCount < 6) {
-            let theme = 'none';
-            try {
-                const panelEl = document.getElementById('token_flow_panel');
-                theme = (panelEl && panelEl.getAttribute && panelEl.getAttribute('data-tf-theme')) || 'none';
-            } catch { theme = 'none'; }
-            tfLog('error', 'ui.blank', '概览卡片没渲染完整（' + cardCount + '/6）—— 面板可能看起来是空的', {
-                container: el.id || '(no id)',
-                children: el.childElementCount,
-                viewport: (window.innerWidth || 0) + 'x' + (window.innerHeight || 0),
-                theme,
-            });
-        }
+    // v2.9.0：统计 / 管理 双页签。管理页是价格与渠道的唯一编辑入口。
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tf-tabs';
+    for (const tab of [['stats', '统计'], ['manage', '管理']]) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'tf-tab-btn' + (tfManageTab === tab[0] ? ' active' : '');
+        b.textContent = safeT(tab[1]);
+        b.addEventListener('click', () => { if (tfManageTab !== tab[0]) { tfManageTab = tab[0]; safeUpdateUI(); } });
+        tabBar.appendChild(b);
     }
+    el.appendChild(tabBar);
 
-    // ============ v1.3.0：Gemini 风格用量限额面板 ============
-    renderGeminiQuota(el, s);
+    if (tfManageTab === 'manage') {
+        try {
+            renderManagePage(el, s);
+        } catch (error) {
+            // 管理页一旦抛异常不能留白屏：回退显示统计页，细节进运行日志
+            tfLog('error', 'ui.render', '管理页渲染失败: ' + (error?.message || error) + '，本帧回退到统计页');
+            tfManageTab = 'stats';
+            el.appendChild(grid);
+        }
+    } else {
+        el.appendChild(grid);
 
-    // ============ v2.1.0：运行日志 ============
-    renderLogPanel(el, s);
+        // 渲染后自检：真机上出现过「概览 6 张卡占着位置、却整块没画出来」，
+        // 而用户设备上没有 DevTools —— 面板变空只能靠猜。这里把现场写进运行日志
+        // （面板底部就能看到、也能复制出来），下次一出问题就有证据可查。
+        if (s.enabled && el && typeof el.querySelectorAll === 'function') {
+            let cardCount = -1;
+            try { cardCount = el.querySelectorAll('.tf-stat-card').length; } catch { cardCount = -1; }
+            if (cardCount >= 0 && cardCount < 6) {
+                let theme = 'none';
+                try {
+                    const panelEl = document.getElementById('token_flow_panel');
+                    theme = (panelEl && panelEl.getAttribute && panelEl.getAttribute('data-tf-theme')) || 'none';
+                } catch { theme = 'none'; }
+                tfLog('error', 'ui.blank', '概览卡片没渲染完整（' + cardCount + '/6）—— 面板可能看起来是空的', {
+                    container: el.id || '(no id)',
+                    children: el.childElementCount,
+                    viewport: (window.innerWidth || 0) + 'x' + (window.innerHeight || 0),
+                    theme,
+                });
+            }
+        }
+
+        // ============ v1.3.0：Gemini 风格用量限额面板 ============
+        renderGeminiQuota(el, s);
+
+        // ============ v2.1.0：运行日志 ============
+        renderLogPanel(el, s);
+    }
+    if (scrollSaved > 0) { try { el.scrollTop = scrollSaved; } catch { /* ignore */ } }
 }
 
 /* ============================================================
@@ -2319,6 +2402,20 @@ function saveOrbPosition(win, x, y, scale) {
 const TF_OVERLAY_MARGIN = 8;
 let tfLastPlaceLevel = -1;
 
+// v2.9.0 定位冻结：面板开着期间，只要视口没变且现有摆放校验通过，就不再重新定位。
+// 背景：旧版每次重画后都按「新内容高度」重新居中/贴底，于是点柱状图（明细块出现）、
+// 改设置、一次请求进账……任何让内容变高/变矮的动作都会让整块面板跳一下。
+// 冻结后内容增高只让 .tf-panel-body 内部滚动，外壳原地不动；重新定位只在
+// 打开面板 / 视口变化 / 校验失败这三种情况下发生。
+const TF_GEOM_EPS = 1;   // 视口尺寸比较的容差（地址栏收放有时差 1px）
+let tfLastGeom = null;   // { vw, vh }
+
+function tfPanelGeomValid(vw, vh) {
+    return !!tfLastGeom
+        && Math.abs(tfLastGeom.vw - vw) <= TF_GEOM_EPS
+        && Math.abs(tfLastGeom.vh - vh) <= TF_GEOM_EPS;
+}
+
 function tfPanelOk(panel, vh) {
     try {
         const r = panel.getBoundingClientRect();
@@ -2348,7 +2445,16 @@ function tfSyncFloatingGeometry() {
         }
 
         const panel = document.getElementById('token_flow_panel');
-        if (!panel || panel.style.display === 'none') return;
+        if (!panel || panel.style.display === 'none') {
+            tfLastGeom = null;
+            return;
+        }
+
+        // v2.9.0 定位冻结：同视口 + 现有摆放仍通过校验 → 直接复用，不重新量、不重摆。
+        // 校验是现摆的那套 tfPanelOk（表头在屏内、底边不出屏），摆歪了照样会走重摆路径。
+        if (tfPanelGeomValid(vw, vh) && tfPanelOk(panel, vh)) {
+            return;
+        }
 
         // 每次都从「干净状态」量：清掉上一轮的写入，免得影响测量
         panel.style.position = '';
@@ -2391,6 +2497,9 @@ function tfSyncFloatingGeometry() {
             panel.style.marginLeft = '0px';
             panel.style.marginTop = '0px';
         }
+
+        // 摆完（含降级）才记账：中途抛异常时旧标注会失效，下次进来照常重摆
+        tfLastGeom = { vw, vh };
 
         if (level !== tfLastPlaceLevel) {
             tfLastPlaceLevel = level;
@@ -3468,6 +3577,549 @@ function onPricesChanged() {
     safeUpdateUI();
 }
 
+/* ============================================================
+ *  v2.9.0 · 统一管理页（统计面板内「统计 / 管理」双页签）
+ *  - 模型价格：卡片式编辑，先标记、点「保存并重算」才落账（可随时放弃）
+ *  - 批量粘贴：行文本（名称, 输入, 输出, 缓存[, 按次, 倍率]）或 JSON 数组
+ *  - 待定价清单：用过的但没单价的模型，开箱即填
+ *  - 渠道子页：官方预填 + 自建渠道；口径 = 酒馆 API 类型或转口 origin
+ *  UI 遵循 sillytavern-embedded-ui 规范：语义结构、响应式、≥44px 触控目标
+ *  ============================================================ */
+
+// 酒馆请求体 chat_completion_source 的取值（SillyTavern release 源码逐字核对）
+const TF_SOURCE_OPTIONS = [
+    { v: 'makersuite', label: 'Google（AI Studio）' },
+    { v: 'vertexai', label: 'Google（Vertex AI）' },
+    { v: 'openai', label: 'OpenAI 官方' },
+    { v: 'claude', label: 'Anthropic 官方' },
+    { v: 'deepseek', label: 'DeepSeek 官方' },
+    { v: 'openrouter', label: 'OpenRouter' },
+    { v: 'zai', label: '智谱（GLM）' },
+    { v: 'moonshot', label: 'Moonshot（Kimi）' },
+    { v: 'mistralai', label: 'Mistral' },
+    { v: 'xai', label: 'xAI' },
+    { v: 'groq', label: 'Groq' },
+];
+
+// 系统预填的官方渠道（可改可删）
+const TF_BUILTIN_CHANNELS = [
+    { name: 'Google', sources: ['makersuite', 'vertexai'] },
+    { name: 'DeepSeek', sources: ['deepseek'] },
+    { name: 'OpenAI', sources: ['openai'] },
+    { name: 'Anthropic', sources: ['claude'] },
+    { name: 'OpenRouter', sources: ['openrouter'] },
+];
+
+let tfManageTab = 'stats';    // 'stats' | 'manage'
+let tfManageSub = 'models';   // 'models' | 'channels'
+let tfPriceDraft = null;      // 价格草稿（s.models 深拷贝）；null = 无未保存编辑
+let tfManageQuery = '';
+let tfManageOnlyUnpriced = false;
+let tfBatchOpen = false;
+let tfBatchText = '';
+let tfBatchResult = null;     // { ok: [{name,...}], bad: ['原行'] }
+let tfNewChannelOpen = false; // 自建渠道表单开合
+
+function tfSourceOptions() {
+    return TF_SOURCE_OPTIONS.filter((o) => o.label);
+}
+
+function tfIsBuiltinChannel(c) {
+    return TF_BUILTIN_CHANNELS.some((b) => b.name === c.name);
+}
+
+/** 把渠道规则排成 map：口径 -> 渠道名。先定义的优先（renderGroupTable 用它） */
+function tfChannelRules(s) {
+    const map = {};
+    for (const c of (s.channels || [])) {
+        for (const src of (c.sources || [])) {
+            if (src && map[src] === undefined) map[src] = c.name;
+        }
+    }
+    return map;
+}
+
+function tfChannelOfSource(s, sourceKey) {
+    const rules = tfChannelRules(s);
+    if (sourceKey && rules[sourceKey] !== undefined) return rules[sourceKey];
+    return null;   // 允许返回空串渠道名；null = 未归类
+}
+
+function tfPriceBadge(s, name) {
+    const p = getPriceFor(s, name);
+    const map = { exact: ['精确定价', 'ok'], alias: ['别名匹配', 'ok'], ambiguous: ['多个候选（建议设别名）', 'warn'],
+                  fuzzy: ['模糊推断', 'warn'], none: ['未设单价', 'warn'] };
+    const m = map[p && p.matchedBy] || ['未设单价', 'warn'];
+    return { text: m[0], tone: m[1] };
+}
+
+/* ---------- 管理页：模型价格子页 ---------- */
+
+function renderManagePage(container, s) {
+    const page = document.createElement('div');
+    page.className = 'tf-manage';
+    const subbar = document.createElement('div');
+    subbar.className = 'tf-subtabs';
+    for (const sub of [['models', '模型价格'], ['channels', '渠道']]) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'tf-subtab-btn' + (tfManageSub === sub[0] ? ' active' : '');
+        b.textContent = safeT(sub[1]);
+        b.addEventListener('click', () => { if (tfManageSub !== sub[0]) { tfManageSub = sub[0]; safeUpdateUI(); } });
+        subbar.appendChild(b);
+    }
+    page.appendChild(subbar);
+
+    if (tfManageSub === 'channels') {
+        renderChannelsSub(page, s);
+    } else {
+        renderModelsSub(page, s);
+    }
+    container.appendChild(page);
+}
+
+function tfEnsureDraft(s) {
+    if (!tfPriceDraft) {
+        tfPriceDraft = (s.models || []).map((m) => Object.assign({}, m));
+    }
+    return tfPriceDraft;
+}
+
+function renderModelsSub(container, s) {
+    const draft = tfEnsureDraft(s);
+
+    // 工具行：搜索 + 只看未定价 + 批量粘贴
+    const toolbar = document.createElement('div');
+    toolbar.className = 'tf-manage-toolbar';
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'text_pole tf-search';
+    search.placeholder = safeT('搜索模型名…');
+    search.value = tfManageQuery;
+    search.addEventListener('input', () => {
+        tfManageQuery = search.value;
+        tfRerenderModelList(container, s, draft);
+    });
+    toolbar.appendChild(search);
+
+    const unpricedToggle = document.createElement('label');
+    unpricedToggle.className = 'tf-check';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = tfManageOnlyUnpriced;
+    cb.addEventListener('change', () => { tfManageOnlyUnpriced = cb.checked; tfRerenderModelList(container, s, draft); });
+    unpricedToggle.appendChild(cb);
+    unpricedToggle.appendChild(document.createTextNode(' ' + safeT('只看未定价')));
+    toolbar.appendChild(unpricedToggle);
+
+    const batchBtn = document.createElement('button');
+    batchBtn.textContent = safeT('批量粘贴');
+    batchBtn.className = 'menu_button menu_button_icon';
+    batchBtn.addEventListener('click', () => { tfBatchOpen = !tfBatchOpen; tfBatchResult = null; tfRerenderModelList(container, s, draft); });
+    toolbar.appendChild(batchBtn);
+    container.appendChild(toolbar);
+
+    // 待定价清单（数据来自已保存的 s，不跟草稿走）
+    const missing = collectUnpricedModels(s);
+    if (missing.length) {
+        const pend = document.createElement('div');
+        pend.className = 'tf-pending';
+        const pendHead = document.createElement('div');
+        pendHead.className = 'tf-pending-head';
+        pendHead.textContent = '⚠ ' + safeT('用过但没设单价') + '（' + missing.length + '）· ' + safeT('费用暂记 0');
+        pend.appendChild(pendHead);
+        const pendAdd = tfButton(safeT('全部补入下方列表'), () => {
+            for (const m of missing) {
+                const exists = draft.some((d) => String(d.name).toLowerCase() === m.name.toLowerCase());
+                if (!exists) draft.push({ name: m.name, input: 0, output: 0, cached: 0, perRequest: 0, multiplier: 1, userEdited: true });
+            }
+            tfRerenderModelList(container, s, draft);
+            safeUpdateUI();
+        }, 'tf-diag-btn');
+        pend.appendChild(pendAdd);
+        for (const m of missing.slice(0, 8)) {
+            const row = document.createElement('div');
+            row.className = 'tf-pending-row';
+            row.textContent = m.name + ' · ' + fmtTokens(m.tokens) + ' tok · ' + m.req + safeT('次');
+            pend.appendChild(row);
+        }
+        container.appendChild(pend);
+    }
+
+    // 批量粘贴区
+    if (tfBatchOpen) {
+        const box = document.createElement('div');
+        box.className = 'tf-batch';
+        const ta = document.createElement('textarea');
+        ta.className = 'text_pole tf-batch-ta';
+        ta.rows = 6;
+        ta.placeholder = safeT('一行一个模型：名称, 输入, 输出, 缓存[, 按次, 倍率]\n或粘贴 JSON 数组');
+        ta.value = tfBatchText;
+        ta.addEventListener('input', () => { tfBatchText = ta.value; });
+        box.appendChild(ta);
+        const row = document.createElement('div');
+        row.className = 'tf-btn-row';
+        const preview = tfButton(safeT('解析预览'), () => {
+            tfBatchResult = tfParseBatch(textSplitLines(ta.value));
+            tfRerenderModelList(container, s, draft);
+        }, 'tf-diag-btn');
+        row.appendChild(preview);
+        box.appendChild(row);
+        if (tfBatchResult) {
+            const res = document.createElement('div');
+            res.className = 'tf-batch-result';
+            res.textContent = safeT('可导入 {n} 条，无法解析 {m} 行（显示原名，可改后重试）')
+                .replace('{n}', String(tfBatchResult.ok.length)).replace('{m}', String(tfBatchResult.bad.length));
+            box.appendChild(res);
+            for (const bad of tfBatchResult.bad.slice(0, 3)) {
+                const badRow = document.createElement('div');
+                badRow.className = 'tf-batch-bad';
+                badRow.textContent = '✕ ' + bad;
+                box.appendChild(badRow);
+            }
+        }
+        const applyRow = document.createElement('div');
+        applyRow.className = 'tf-btn-row';
+        applyRow.appendChild(tfButton(safeT('并入下方列表（覆盖同名单价）'), () => {
+            if (!tfBatchResult || !tfBatchResult.ok.length) { tfNotify(safeT('请先解析预览')); return; }
+            for (const r of tfBatchResult.ok) {
+                const hit = draft.find((d) => String(d.name).toLowerCase() === r.name.toLowerCase());
+                if (hit) { hit.input = r.input; hit.output = r.output; hit.cached = r.cached; hit.perRequest = r.perRequest; hit.multiplier = r.multiplier; }
+                else draft.push(Object.assign({}, r));
+            }
+            tfBatchOpen = false; tfBatchText = ''; tfBatchResult = null;
+            tfRerenderModelList(container, s, draft);
+        }, 'tf-diag-btn'));
+        box.appendChild(applyRow);
+        container.appendChild(box);
+    }
+
+    // 模型列表
+    const list = document.createElement('div');
+    list.className = 'tf-model-list';
+    list.id = 'tf_model_manage_list';
+    container.appendChild(list);
+    tfFillModelList(list, s, draft);
+
+    // 底部保存条
+    const footer = document.createElement('div');
+    footer.className = 'tf-manage-footer';
+    const hint = document.createElement('span');
+    hint.className = 'tf-dirty-hint';
+    hint.textContent = safeT('编辑未保存 —— 点「保存并重算」才落账');
+    footer.appendChild(hint);
+    footer.appendChild(tfButton(safeT('放弃编辑'), () => {
+        tfPriceDraft = null;
+        safeUpdateUI();
+    }, 'tf-diag-btn'));
+    footer.appendChild(tfButton(safeT('保存并重算'), () => {
+        s.models = tfPriceDraft;
+        tfPriceDraft = null;
+        tfManageOnlyUnpriced = false;
+        onPricesChanged();
+        tfNotify(safeT('已保存，费用已按新价格重算'));
+    }));
+    container.appendChild(footer);
+}
+
+function textSplitLines(text) {
+    return String(text || '').split(/\r?\n/);
+}
+
+function tfParseBatch(lines) {
+    const ok = [];
+    const bad = [];
+    let jsonItems = null;
+    const joined = lines.join('\n').trim();
+    if (joined.startsWith('[')) {
+        try {
+            const parsed = JSON.parse(joined);
+            if (Array.isArray(parsed)) jsonItems = parsed;
+        } catch { jsonItems = null; }
+        if (!jsonItems) { bad.push('(JSON 解析失败)'); }
+    }
+    if (jsonItems) {
+        for (const it of jsonItems) {
+            if (!it || typeof it !== 'object') { bad.push(String(it)); continue; }
+            const name = String(it.name || it.model || '').trim();
+            if (!name) { bad.push(JSON.stringify(it).slice(0, 60)); continue; }
+            // OpenRouter pricing.prompt/completion 是 $/token，换算成 $/1M
+            let input = tfNumOf(it.input ?? it.input_price ?? (it.pricing ? Number(it.pricing.prompt) * 1e6 : 0));
+            let output = tfNumOf(it.output ?? it.output_price ?? (it.pricing ? Number(it.pricing.completion) * 1e6 : 0));
+            let cached = tfNumOf(it.cached ?? it.cache_price ?? (it.pricing ? Number(it.pricing.input_cache_read || 0) * 1e6 : 0));
+            if (Number.isNaN(input) || Number.isNaN(output) || Number.isNaN(cached)) { bad.push(name + '（价格字段不可解析）'); continue; }
+            ok.push({ name, input, output, cached, perRequest: tfNumOf(it.perRequest || it.per_request || 0), multiplier: tfNumOf(it.multiplier || 1) || 1, userEdited: true });
+        }
+    } else if (!bad.length) {
+        for (const raw of lines) {
+            const line = String(raw).trim();
+            if (!line) continue;
+            const cells = line.split(/[,，\t;；]/).map((c) => c.trim());
+            const name = cells[0];
+            if (!name) { bad.push(line); continue; }
+            const nums = cells.slice(1).map(tfNumOf);
+            if (nums.length < 3 || nums.slice(0, 3).some((n) => Number.isNaN(n))) { bad.push(line); continue; }
+            ok.push({ name, input: nums[0], output: nums[1], cached: nums[2],
+                      perRequest: nums[3] || 0, multiplier: tfNumOf(nums[4]) || 1, userEdited: true });
+        }
+    }
+    return { ok, bad };
+}
+
+function tfNumOf(v) {
+    if (v === undefined || v === null || v === '') return 0;
+    const n = parseFloat(String(v).replace(/[$￥,]/g, ''));
+    return Number.isFinite(n) ? n : NaN;
+}
+
+function tfRerenderModelList(container, s, draft) {
+    const list = document.getElementById('tf_model_manage_list');
+    if (list) tfFillModelList(list, s, draft);
+}
+
+function tfFillModelList(list, s, draft) {
+    list.innerHTML = '';
+    const q = tfManageQuery.trim().toLowerCase();
+    const rows = [];
+    for (const m of draft) {
+        const badge = tfPriceBadge(s, m.name);
+        if (q && String(m.name).toLowerCase().indexOf(q) === -1) continue;
+        if (tfManageOnlyUnpriced && badge.tone !== 'warn') continue;
+        rows.push({ m, badge });
+    }
+    // 未定价的自动排前面，便于先处理这些卡片
+    rows.sort((a, b) => (a.badge.tone === 'warn' ? -1 : 1) - (b.badge.tone === 'warn' ? -1 : 1));
+    if (!rows.length) {
+        const empty = document.createElement('div');
+        empty.className = 'tf-writing-hint';
+        empty.textContent = safeT('列表是空的');
+        list.appendChild(empty);
+        return;
+    }
+
+    for (const { m, badge } of rows) {
+        const card = document.createElement('div');
+        card.className = 'tf-model-card' + (badge.tone === 'warn' ? ' warn' : '');
+        const head = document.createElement('div');
+        head.className = 'tf-model-card-head';
+        const nameInp = document.createElement('input');
+        nameInp.className = 'text_pole tf-card-name';
+        nameInp.value = String(m.name ?? '');
+        nameInp.addEventListener('input', () => { m.name = nameInp.value; m.userEdited = true; });
+        head.appendChild(nameInp);
+        const b = document.createElement('span');
+        b.className = 'tf-card-badge' + (badge.tone === 'warn' ? ' warn' : '');
+        b.textContent = badge.text;
+        head.appendChild(b);
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'tf-del';
+        del.textContent = '✕';
+        del.title = safeT('删除这个模型');
+        del.addEventListener('click', () => {
+            const idx = draft.indexOf(m);
+            if (idx >= 0) draft.splice(idx, 1);
+            tfRerenderModelList(list.closest('.tf-manage'), s, draft);
+        });
+        head.appendChild(del);
+        card.appendChild(head);
+
+        const grid = document.createElement('div');
+        grid.className = 'tf-card-grid';
+        const fields = [['input', '输入 $/1M'], ['output', '输出 $/1M'], ['cached', '缓存 $/1M'], ['perRequest', '按次 $'], ['multiplier', '倍率 (x)']];
+        for (const [f, label] of fields) {
+            const cell = document.createElement('label');
+            cell.className = 'tf-card-field';
+            const span = document.createElement('span');
+            span.className = 'tf-card-field-label';
+            span.textContent = safeT(label);
+            cell.appendChild(span);
+            const inp = document.createElement('input');
+            inp.type = 'number';
+            inp.step = 'any';
+            inp.className = 'text_pole tf-num-lg';
+            inp.value = typeof m[f] === 'number' ? m[f] : (f === 'multiplier' ? 1 : 0);
+            inp.addEventListener('input', () => {
+                const v = parseFloat(inp.value);
+                m[f] = Number.isFinite(v) ? v : (f === 'multiplier' ? 1 : 0);
+                m.userEdited = true;
+                const note = list.closest('.tf-manage').querySelector('.tf-dirty-hint');
+                if (note) note.classList.add('dirty');
+            });
+            cell.appendChild(inp);
+            grid.appendChild(cell);
+        }
+        card.appendChild(grid);
+
+        const aliasLine = document.createElement('label');
+        aliasLine.className = 'tf-card-field wide';
+        const aliasSpan = document.createElement('span');
+        aliasSpan.className = 'tf-card-field-label';
+        aliasSpan.textContent = safeT('别名');
+        aliasLine.appendChild(aliasSpan);
+        const aliasInp = document.createElement('input');
+        aliasInp.className = 'text_pole tf-alias-lg';
+        aliasInp.value = m.aliases || '';
+        aliasInp.placeholder = safeT('逗号分隔');
+        aliasInp.addEventListener('change', () => { m.aliases = aliasInp.value; m.userEdited = true; });
+        aliasLine.appendChild(aliasInp);
+        card.appendChild(aliasLine);
+
+        list.appendChild(card);
+    }
+}
+
+/* ---------- 管理页：渠道子页 ---------- */
+
+function renderChannelsSub(container, s) {
+    if (!Array.isArray(s.channels)) s.channels = [];
+    // 官方预填缺失则补上（老设置升级时）
+    for (const b of TF_BUILTIN_CHANNELS) {
+        if (!s.channels.some((c) => c.name === b.name)) s.channels.push(Object.assign({ builtin: true }, b));
+    }
+    const intro = document.createElement('div');
+    intro.className = 'tf-writing-hint';
+    intro.textContent = safeT('渠道 = 这笔消费从哪个口子走。官方渠道按酒馆选的 API 类型自动归；转口选「自定义」填地址。改完立即影响分组（含历史）');
+    container.appendChild(intro);
+
+    const list = document.createElement('div');
+    list.className = 'tf-channel-list';
+    s.channels.forEach((c, i) => {
+        const card = document.createElement('div');
+        card.className = 'tf-channel-card';
+        const head = document.createElement('div');
+        head.className = 'tf-model-card-head';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'tf-channel-name';
+        nameEl.textContent = c.name;
+        head.appendChild(nameEl);
+        const tag = document.createElement('span');
+        tag.className = 'tf-card-badge';
+        tag.textContent = c.builtin ? safeT('系统预填') : safeT('自建');
+        head.appendChild(tag);
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'tf-del';
+        del.textContent = '✕';
+        del.title = safeT('删除这个渠道');
+        del.addEventListener('click', () => {
+            s.channels.splice(i, 1);
+            onPricesChanged();
+        });
+        head.appendChild(del);
+        card.appendChild(head);
+        const srcLine = document.createElement('div');
+        srcLine.className = 'tf-channel-src';
+        srcLine.textContent = (c.sources || []).map(tfSourceLabel).join(' · ') || safeT('（没配口径，不会拦到任何请求）');
+        srcLine.title = safeT('点下方「编辑」修改');
+        card.appendChild(srcLine);
+        const btnRow = document.createElement('div');
+        btnRow.className = 'tf-btn-row';
+        const editBtn = tfButton(safeT('编辑'), () => {
+            tfNewChannelOpen = { mode: 'edit', idx: i };
+            safeUpdateUI();
+        }, 'tf-diag-btn');
+        btnRow.appendChild(editBtn);
+        card.appendChild(btnRow);
+        list.appendChild(card);
+    });
+    container.appendChild(list);
+
+    const addBtn = tfButton(safeT('＋自建渠道'), () => {
+        tfNewChannelOpen = { mode: 'new' };
+        safeUpdateUI();
+    }, 'tf-diag-btn');
+    container.appendChild(addBtn);
+
+    if (tfNewChannelOpen) {
+        const form = document.createElement('div');
+        form.className = 'tf-channel-form';
+        const nameInp = document.createElement('input');
+        nameInp.type = 'text';
+        nameInp.className = 'text_pole tf-card-name';
+        nameInp.placeholder = safeT('渠道名，如：opencode 中转');
+        const mode = tfNewChannelOpen.mode === 'edit' ? s.channels[tfNewChannelOpen.idx] : null;
+        nameInp.value = mode ? mode.name : '';
+        form.appendChild(nameInp);
+
+        const sourcesBox = document.createElement('div');
+        sourcesBox.className = 'tf-channel-sources';
+        const cur = mode ? (mode.sources || []).slice() : [];
+        const renderSourceRows = () => {
+            sourcesBox.innerHTML = '';
+            cur.forEach((src, k) => {
+                const rowEl = document.createElement('div');
+                rowEl.className = 'tf-channel-src-row';
+                const sel = document.createElement('select');
+                sel.className = 'text_pole tf-source-sel';
+                for (const o of tfSourceOptions()) {
+                    const opt = document.createElement('option');
+                    opt.value = o.v;
+                    opt.textContent = o.label;
+                    sel.appendChild(opt);
+                }
+                const customVal = src.startsWith('custom:') ? src.slice(7) : '';
+                sel.value = src.startsWith('custom:') ? 'custom' : (tfSourceOptions().some((o) => o.v === src) ? src : 'makersuite');
+                const urlInp = document.createElement('input');
+                urlInp.type = 'text';
+                urlInp.className = 'text_pole tf-origin-inp';
+                urlInp.placeholder = safeT('转口地址，如 https://api.example.com');
+                urlInp.value = customVal;
+                urlInp.style.display = sel.value === 'custom' ? '' : 'none';
+                const syncSrc = () => { cur[k] = sel.value === 'custom' ? 'custom:' + String(urlInp.value).trim() : sel.value; };
+                sel.addEventListener('change', () => { syncSrc(); urlInp.style.display = sel.value === 'custom' ? '' : 'none'; });
+                urlInp.addEventListener('change', syncSrc);
+                const delBtn = document.createElement('button');
+                delBtn.type = 'button';
+                delBtn.className = 'tf-del';
+                delBtn.textContent = '✕';
+                delBtn.addEventListener('click', () => { cur.splice(k, 1); renderSourceRows(); });
+                rowEl.appendChild(sel);
+                rowEl.appendChild(urlInp);
+                rowEl.appendChild(delBtn);
+                sourcesBox.appendChild(rowEl);
+            });
+        };
+        if (!cur.length) cur.push('makersuite');
+        renderSourceRows();
+        form.appendChild(sourcesBox);
+
+        const addSrc = tfButton(safeT('＋再加一口径'), () => { cur.push('makersuite'); renderSourceRows(); }, 'tf-diag-btn');
+        form.appendChild(addSrc);
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'tf-btn-row';
+        btnRow.appendChild(tfButton(safeT('保存渠道'), () => {
+            const name = nameInp.value.trim();
+            if (!name) { tfNotify(safeT('渠道名不能为空')); return; }
+            const sources = cur.map((x) => String(x).trim()).filter(Boolean);
+            if (!sources.length) { tfNotify(safeT('至少配一个口径')); return; }
+            if (tfNewChannelOpen.mode === 'edit') {
+                s.channels[tfNewChannelOpen.idx] = { name, sources };
+            } else {
+                if (s.channels.some((c) => c.name === name)) { tfNotify(safeT('已有同名渠道')); return; }
+                s.channels.push({ name, sources });
+            }
+            tfNewChannelOpen = false;
+            onPricesChanged();
+        }));
+        btnRow.appendChild(tfButton(safeT('取消'), () => { tfNewChannelOpen = false; safeUpdateUI(); }, 'tf-diag-btn'));
+        form.appendChild(btnRow);
+        container.appendChild(form);
+    }
+}
+
+function tfSourceLabel(src) {
+    if (String(src).startsWith('custom:')) return safeT('转口') + ' ' + String(src).slice(7);
+    const o = tfSourceOptions().find((x) => x.v === src);
+    return o ? o.label : String(src);
+}
+
+function tfNotify(msg) {
+    try { globalThis.Toast?.info?.(msg, 'SillyToken'); } catch { /* 没有宿主 Toast 就算了 */ }
+}
+
+
 /**
  * 只取「今天」的累计。
  * dailyStats 只在有请求进来时才会滚到新的一天，所以隔夜之后它里面还是
@@ -3804,6 +4456,13 @@ function tfAggregateRange(s, range) {
     const dayMap = new Map();
     const byModel = new Map();
     const byProvider = new Map();
+    // v2.9.0 渠道聚合：source 有分桶的记录按口径归类；
+    // 没来源的老记录先看「天级补丁」（数据层见 s.dayPatches），没有补丁归「未知」
+    const byChannel = new Map();
+    const patchesByDate = new Map();
+    for (const p of (s.dayPatches || [])) {
+        if (p && p.date && p.channel) patchesByDate.set(String(p.date), p);
+    }
     const summary = { ...tfNewBucket(), legacyDays: 0, legacyTokens: 0, legacyCost: 0 };
 
     const addModel = (name, entry) => {
@@ -3829,8 +4488,35 @@ function tfAggregateRange(s, range) {
         tfAccumulate(byProvider.get(provider), entry, name);
     };
 
+    const pushChannel = (name, src) => {
+        let b = byChannel.get(name);
+        if (!b) { b = { key: name, display: name, ...tfNewBucket() }; byChannel.set(name, b); }
+        tfAccumulate(b, src, null);
+    };
+
+    /** 一天的某个模型桶 → 渠道。有 sources 的按口径归；老记录按补丁/未知归 */
+    const accChannels = (name, entry, dayDate) => {
+        if (!entry) return;
+        const keys = (entry.sources && typeof entry.sources === 'object') ? Object.keys(entry.sources) : null;
+        if (keys && keys.length) {
+            for (const k of keys) pushChannel(tfChannelOfSource(s, k) || safeT('未归类'), entry.sources[k]);
+            return;
+        }
+        const patch = dayDate ? patchesByDate.get(String(dayDate)) : null;
+        if (patch && (!patch.pattern || String(name || '').toLowerCase().startsWith(String(patch.pattern).toLowerCase()))) {
+            pushChannel(patch.channel, entry);
+        } else {
+            pushChannel(safeT('未知（旧记录）'), entry);
+        }
+    };
+
     if (range && range.mode === 'preset' && range.id === 'all') {
-        for (const [name, entry] of Object.entries(s.stats.models || {})) addModel(name, entry);
+        for (const [name, entry] of Object.entries(s.stats.models || {})) {
+            addModel(name, entry);
+            // 「全部」口径用 lifetime 桶，没有日期上下文，天级补丁不参与：
+            // 有 sources 的按渠道归，没有的归「未知（旧记录）」
+            accChannels(name, entry, null);
+        }
         for (const rec of (s.history || [])) {
             if (rec && rec.date) dayMap.set(rec.date, rec);
         }
@@ -3854,7 +4540,10 @@ function tfAggregateRange(s, range) {
         for (const rec of dayMap.values()) {
             const models = rec.models && Object.keys(rec.models).length ? rec.models : null;
             if (models) {
-                for (const [name, entry] of Object.entries(models)) addModel(name, entry);
+                for (const [name, entry] of Object.entries(models)) {
+                    addModel(name, entry);
+                    accChannels(name, entry, rec.date);
+                }
             } else {
                 // 老条目只有总量、没有按模型明细：单独计数。
                 // 不能塞进「输入」里 —— 那会把输入抬高、把命中率压低。
@@ -3888,11 +4577,14 @@ function tfAggregateRange(s, range) {
         summary,
         models: [...byModel.values()],
         providers: [...byProvider.values()],
+        channels: [...byChannel.values()],
     };
 }
 
 function tfGroupList(stats) {
-    return tfGroupMode === 'provider' ? stats.providers : stats.models;
+    if (tfGroupMode === 'provider') return stats.providers;
+    if (tfGroupMode === 'channel') return stats.channels;
+    return stats.models;
 }
 
 function tfHitRate(bucket) {
@@ -3970,6 +4662,7 @@ function tfRenderRangePicker(container, s) {
     groups.className = 'tf-range-group';
     groups.appendChild(tfChip(safeT('按模型'), tfGroupMode === 'model', () => { tfGroupMode = 'model'; safeUpdateUI(); }));
     groups.appendChild(tfChip(safeT('按厂商'), tfGroupMode === 'provider', () => { tfGroupMode = 'provider'; safeUpdateUI(); }));
+    groups.appendChild(tfChip(safeT('按渠道'), tfGroupMode === 'channel', () => { tfGroupMode = 'channel'; safeUpdateUI(); }));
     row.appendChild(groups);
     container.appendChild(row);
 
@@ -4184,6 +4877,88 @@ function tfRenderChart(container, s, stats) {
     container.appendChild(block);
 }
 
+let tfPatchDraftOpen = false;
+
+/** v2.9.0 天级补丁栏：把某天（不真实的来源数据）整体归入某个渠道 */
+function renderDayPatchBar(box, s, date) {
+    if (!Array.isArray(s.dayPatches)) s.dayPatches = [];
+    const existing = s.dayPatches.find((p) => p && p.date === date);
+    const bar = document.createElement('div');
+    bar.className = 'tf-day-patch-bar';
+    const tag = document.createElement('span');
+    tag.className = 'tf-day-patch-tag' + (existing ? ' set' : '');
+    tag.textContent = existing
+        ? safeT('已按天归组') + '：' + existing.channel + (existing.pattern ? '（仅 ' + existing.pattern + ' 开头）' : '')
+        : safeT('这天是老记录？可整体归入某个渠道');
+    bar.appendChild(tag);
+
+    bar.appendChild(tfButton(safeT('归入渠道'), () => {
+        tfPatchDraftOpen = !tfPatchDraftOpen;
+        safeUpdateUI();
+    }, 'tf-diag-btn'));
+
+    if (existing) {
+        bar.appendChild(tfButton(safeT('撤销'), () => {
+            const idx = s.dayPatches.indexOf(existing);
+            if (idx >= 0) s.dayPatches.splice(idx, 1);
+            saveSettingsDebounced();
+            safeUpdateUI();
+        }, 'tf-diag-btn'));
+    }
+    box.appendChild(bar);
+
+    if (tfPatchDraftOpen) {
+        const form = document.createElement('div');
+        form.className = 'tf-day-patch-form';
+        const names = (s.channels || []).map((c) => c.name).filter(Boolean);
+        if (!names.length) {
+            const hint = document.createElement('div');
+            hint.className = 'tf-writing-hint';
+            hint.textContent = safeT('还没有渠道 —— 先到「管理 → 渠道」建一个（系统预填的官方渠道已自动就位）');
+            form.appendChild(hint);
+        }
+        const sel = document.createElement('select');
+        sel.className = 'text_pole tf-source-sel';
+        for (const n of names) {
+            const o = document.createElement('option');
+            o.value = n;
+            o.textContent = n;
+            sel.appendChild(o);
+        }
+        if (existing) sel.value = existing.channel;
+        form.appendChild(sel);
+
+        const patInp = document.createElement('input');
+        patInp.className = 'text_pole tf-origin-inp';
+        patInp.placeholder = safeT('可选：只归指定开头的模型，如 gemini');
+        patInp.value = existing ? (existing.pattern || '') : '';
+        form.appendChild(patInp);
+
+        const note = document.createElement('div');
+        note.className = 'tf-writing-hint';
+        note.textContent = safeT('只影响没有来源信息的老记录；新版记录的真实口径不受影响，随时可撤销');
+        form.appendChild(note);
+
+        const row = document.createElement('div');
+        row.className = 'tf-btn-row';
+        row.appendChild(tfButton(safeT('保存归组'), () => {
+            const channel = sel.value;
+            if (!channel) { tfNotify(safeT('还没有可用渠道')); return; }
+            const pattern = String(patInp.value || '').trim().toLowerCase();
+            // 同一天 + 同范围 = 覆盖更新，避免重复补丁叠罗汉
+            const idx = s.dayPatches.findIndex((p) => p && p.date === date && (p.pattern || '') === pattern);
+            if (idx >= 0) s.dayPatches[idx] = { date, pattern, channel };
+            else s.dayPatches.push({ date, pattern, channel });
+            tfPatchDraftOpen = false;
+            saveSettingsDebounced();
+            safeUpdateUI();
+        }));
+        row.appendChild(tfButton(safeT('取消'), () => { tfPatchDraftOpen = false; safeUpdateUI(); }, 'tf-diag-btn'));
+        form.appendChild(row);
+        box.appendChild(form);
+    }
+}
+
 function tfRenderDayDetail(container, s, stats) {
     if (!tfSelectedDay) return;
     const day = stats.days.find((d) => d.date === tfSelectedDay);
@@ -4201,6 +4976,11 @@ function tfRenderDayDetail(container, s, stats) {
     head.appendChild(left);
     head.appendChild(right);
     box.appendChild(head);
+
+    // ---- v2.9.0 天级补丁：老数据（没有来源信息）按天手动归渠道 ----
+    // 用户口径：升级前基本一个口子连跑数日 → 选天选厂商一次归组，不用逐条翻。
+    // 补丁只影响「没有来源数据」的记录；新版收集到的真实口径不受影响。
+    renderDayPatchBar(box, s, day.date);
 
     const entries = Object.entries(day.models || {});
     if (!entries.length) {
@@ -4250,7 +5030,9 @@ function tfRenderGroupTable(container, s, stats) {
 
     const title = document.createElement('div');
     title.className = 'tf-model-title';
-    title.textContent = safeT('明细') + ' · ' + (tfGroupMode === 'provider' ? safeT('按厂商') : safeT('按模型')) + ' · ' + safeT('按费用排序');
+    const modeLabel = tfGroupMode === 'provider' ? safeT('按厂商')
+        : (tfGroupMode === 'channel' ? safeT('按渠道') : safeT('按模型'));
+    title.textContent = safeT('明细') + ' · ' + modeLabel + ' · ' + safeT('按费用排序');
     tbl.appendChild(title);
 
     const palette = ['#5eead4', '#93c5fd', '#c4b5fd', '#fda4af', '#fcd34d', '#86efac', '#f9a8d4', '#a5b4fc'];
