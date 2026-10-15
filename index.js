@@ -24,6 +24,8 @@ function safeT(key) {
 const MODULE = 'token_flow';
 const GENERATE_ENDPOINT = '/api/backends/chat-completions/generate';
 const STREAM_DONE = '[DONE]';
+// v2.9.9：主题白名单 —— getSettings 校验与面板主题菜单共用这一份，免得两处各写各的
+const TF_THEMES = ['cyber-royal', 'ink-zen', 'aurora-midnight', 'molten-gold', 'mono-white'];
 
 // 2026 最新旗舰定价（$/1M token，cached 为缓存输入价）
 // Kimi 官方为 CNY，已按 ~7.1 汇率折算为 USD 基准
@@ -106,7 +108,38 @@ const defaultSettings = {
     // dayPatches: [{ date: 'YYYY-MM-DD', allModels: true, pattern: '', channel: '渠道名' }]
     // 仅作用于「没有来源数据的老记录」；有真实来源的记录不受补丁影响
     dayPatches: [],
+    // v2.9.9：用户明确删掉的预设型号（小写名）。存在这里，否则「补旗舰」逻辑
+    // 会在下一次 getSettings() 把它整条加回来 —— 删除按钮等于没用
+    removedPresets: [],
 };
+
+// v2.9.9：价格字段名（getSettings 兜底与 priceHasValue 共用一份）
+const TF_PRICE_FIELDS = ['input', 'output', 'cached', 'perRequest'];
+
+/**
+ * v2.9.9：把任何来源的数值归一为「有限非负数」。
+ * 导入的备份、手改的 settings.json、上游返回的字符串型 token 都可能给出
+ * NaN / Infinity / 负数 / 数字字符串；它们进入算术后会一路污染成 $NaN 或负金额。
+ * 一律在这里收口：算不出来就是 0。
+ */
+function tfNum(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** 归一一条价格表条目：4 个价格字段 + 倍率；名称/别名/标记原样保留 */
+function tfCleanPrice(entry) {
+    const src = (entry && typeof entry === 'object') ? entry : {};
+    const mult = Number(src.multiplier);
+    return {
+        ...src,
+        input: tfNum(src.input),
+        output: tfNum(src.output),
+        cached: tfNum(src.cached),
+        perRequest: tfNum(src.perRequest),
+        multiplier: (Number.isFinite(mult) && mult > 0) ? mult : 1,
+    };
+}
 
 function getSettings() {
     if (extension_settings[MODULE] === undefined) {
@@ -118,7 +151,26 @@ function getSettings() {
     }
     if (!Array.isArray(s.models)) s.models = structuredClone(PRESET_MODELS);
     // v2.9.7：非对象项先剔（手改文件可能混进 null —— 旧版在旗舰补回判断处直接抛 TypeError）
-    s.models = s.models.filter((m) => m && typeof m === 'object');
+    // v2.9.9：只在真的混进脏项时才重建数组 —— 这个函数每次请求/每次渲染都会调，
+    // 无条件 filter 会白白分配一个新数组（手机上是纯浪费）
+    if (s.models.some((m) => !m || typeof m !== 'object')) {
+        s.models = s.models.filter((m) => m && typeof m === 'object');
+    }
+    // v2.9.9：用户明确删掉的预设不再自动补回（否则删除按钮等于没用）
+    if (!Array.isArray(s.removedPresets)) s.removedPresets = [];
+    const removedPresets = new Set(s.removedPresets.map((x) => String(x).toLowerCase()));
+    // v2.9.9：用户把同名条目又加回来了 → 撤销黑名单。等于给了「恢复内置预设」的入口
+    // （不必再加按钮）：手动加回同名行、或从备份导入回来，都会自动解封。
+    if (removedPresets.size) {
+        for (const m of s.models) {
+            const k = String((m && m.name) || '').toLowerCase().trim();
+            if (k) removedPresets.delete(k);
+        }
+        if (removedPresets.size !== s.removedPresets.length) {
+            s.removedPresets = [...removedPresets];
+            saveSettingsDebounced();
+        }
+    }
     // 预设价格表升级（双保险）：
     // 1) 内置版本比用户保存的新时，整体刷新为最新旗舰报价
     // 2) 即便版本号未变，也主动剔除已淘汰的旧模型，并确保当前旗舰系列存在
@@ -127,11 +179,15 @@ function getSettings() {
     const outdatedVersion = (s.modelVersion || 0) < (defaultSettings.modelVersion || 0);
     // 必须精确或「前缀 + 连字符」匹配：旧版用 includes，OBSOLETE 里的 'gpt-5'
     // 命中了内置的 'gpt-5.6-sol'，于是 hasObsolete 永远为真、每次 getSettings() 都重建价格表
-    const hasObsolete = OBSOLETE.some((dep) => s.models.some((m) => {
-        const name = String((m && m.name) || '').toLowerCase().trim();
-        return name === dep || name.startsWith(dep + '-') || name.startsWith(dep + '_');
-    }));
-    const missingFlagships = NEEDS.some(need => !s.models.some(m => m && typeof m === 'object' && String(m.name).toLowerCase() === need));
+    const isObsoleteName = (name) => {
+        const n = String(name || '').toLowerCase().trim();
+        return OBSOLETE.some((dep) => n === dep || n.startsWith(dep + '-') || n.startsWith(dep + '_'));
+    };
+    // v2.9.9：只有「会被丢弃的」残留才算数 —— 用户改过的条目在下面会原样保留，
+    // 若把它们也算进来，hasObsolete 永远为真 → 每次 getSettings 都重建数组 + 落盘
+    const hasObsolete = s.models.some((m) => m && !m.userEdited && isObsoleteName(m.name));
+    const missingFlagships = NEEDS.some(need => !removedPresets.has(need)
+        && !s.models.some(m => m && typeof m === 'object' && String(m.name).toLowerCase() === need));
     if (outdatedVersion || hasObsolete || missingFlagships) {
         // v2.1.0：不再整体覆盖。预设只负责「补新」，用户改过的条目原样保留 ——
         // 否则用户手填的单价会在版本升级时被无声抹掉。
@@ -143,6 +199,8 @@ function getSettings() {
             const key = String(preset.name).toLowerCase();
             const existing = remaining.get(key);
             remaining.delete(key);
+            // v2.9.9：用户删过的预设不补回（还在 remaining 里的走下面的保留分支）
+            if (!existing && removedPresets.has(key)) continue;
             if (existing && existing.userEdited) fresh.push(existing);   // 用户改过 → 尊重用户
             else if (existing) {
                 // 值没变就复用原对象。旧版无条件新建对象，会让设置面板里
@@ -155,7 +213,8 @@ function getSettings() {
         }
         for (const [lower, entry] of remaining) {
             // 已淘汰、且用户从没改过的预设残留可以丢；其余（用户自建模型）一律保留
-            const obsolete = !entry.userEdited && OBSOLETE.some(dep => lower.includes(dep));
+            // v2.9.9：判据与 hasObsolete 统一（不再用 includes 误伤自建模型名）
+            const obsolete = !entry.userEdited && isObsoleteName(lower);
             if (!obsolete) fresh.push(entry);
         }
         s.models = fresh;
@@ -165,9 +224,20 @@ function getSettings() {
     if (!s.stats || typeof s.stats !== 'object') s.stats = structuredClone(defaultSettings.stats);
     if (!s.session || typeof s.session !== 'object') s.session = structuredClone(defaultSettings.session);
     // ===== v1.6.0 兜底：每个模型倍率（缺省 x1）=====
+    // v2.9.9：价格字段就地归一（不换对象）—— 导入/手改进来的 "abc"、Infinity、
+    // 负价会被算成 $NaN 或负金额。就地改是关键：换新对象会让设置面板里
+    // 已打开的输入框闭包脱离实际数据（v2.9.7 修过一次的老毛病）。
     if (Array.isArray(s.models)) {
         for (const mx of s.models) {
-            if (mx && (typeof mx.multiplier !== 'number' || !(mx.multiplier > 0))) mx.multiplier = 1;
+            if (!mx || typeof mx !== 'object') continue;
+            for (const f of TF_PRICE_FIELDS) {
+                const n = Number(mx[f]);
+                mx[f] = (Number.isFinite(n) && n > 0) ? n : 0;
+            }
+            // v2.9.9：顺便转成数字 —— 手改的字符串 "2" 会让界面按 typeof 判成 ×1、
+            // 计费却按 2 倍算，两处口径不一致
+            const multNum = Number(mx.multiplier);
+            mx.multiplier = (Number.isFinite(multNum) && multNum > 0) ? multNum : 1;
         }
     }
     if (!s.stats.models) s.stats.models = {};
@@ -177,7 +247,12 @@ function getSettings() {
     if (!s.dailyStats || typeof s.dailyStats !== 'object') s.dailyStats = { cost: 0, tokens: 0, req: 0 };
     if (!s.dailyStats.models || typeof s.dailyStats.models !== 'object') s.dailyStats.models = {};
     if (!s.budget || typeof s.budget !== 'object') s.budget = { enabled: false, dailyLimit: 0, monthlyLimit: 0 };
-    if (typeof s.contextSize !== 'number') s.contextSize = 128000;
+    // v2.9.9：预算额度也归一 —— 脏值会让预警判定静默失效
+    s.budget.dailyLimit = tfNum(s.budget.dailyLimit);
+    s.budget.monthlyLimit = tfNum(s.budget.monthlyLimit);
+    // v2.9.9：同样转成数字（字符串 "64000" 以前会原样留着）
+    const ctxNum = Number(s.contextSize);
+    s.contextSize = (Number.isFinite(ctxNum) && ctxNum > 0) ? ctxNum : 128000;
     if (typeof s.archiveDays !== 'number' || !Number.isFinite(s.archiveDays) || s.archiveDays <= 0) s.archiveDays = 365;
     // ===== v1.3.0 兜底：Gemini 用量限额 =====
     if (!s.geminiQuota || typeof s.geminiQuota !== 'object') {
@@ -191,8 +266,9 @@ function getSettings() {
     }
     // ===== v2.9.7 安全校验：汇率 / 币种 / 限额时钟（审查第 7、8 条修复）=====
     // 旧版只在导入处截币种长度；汇率不是有限正数会一路算出 $∞、落盘变 null、
-    // 下次加载全部 $0；限额时钟是自由字符串 → .split(':') 抛异常（配额块消失）、
-    // 或把不可信字符串送进 quotaRingHTML 的 innerHTML。
+    // 下次加载全部 $0。
+    // v2.9.9：日/周窗口改为按天对齐后，两个 ResetTime 字段已不参与任何计算与
+    // 显示（也没有编辑入口），这里保留格式校验只为把导入/手改的脏值挡住。
     if (typeof s.exchangeRate !== 'number' || !Number.isFinite(s.exchangeRate) || s.exchangeRate <= 0) s.exchangeRate = 1;
     if (typeof s.displayCurrency !== 'string' || !s.displayCurrency) s.displayCurrency = '$';
     else s.displayCurrency = s.displayCurrency.replace(/[<>&]/g, '').slice(0, 8) || '$';
@@ -207,40 +283,98 @@ function getSettings() {
             const num = Number(s.geminiQuota[k]);
             s.geminiQuota[k] = Number.isFinite(num) && num >= 0 ? num : 0;
         }
+        // v2.9.9：周重置日也校验 —— 非数字会让 % 7 得 NaN → Invalid Date，
+        // 周环变成「只算今天」、文案还会显示成空白「重置 · 」
+        const wd = Number(s.geminiQuota.weeklyResetDay);
+        s.geminiQuota.weeklyResetDay = (Number.isInteger(wd) && wd >= 0 && wd <= 6) ? wd : 4;
         for (const k of ['upgradeLabel', 'upgradePrice']) {
             if (typeof s.geminiQuota[k] !== 'string') s.geminiQuota[k] = defaultSettings.geminiQuota[k];
             else s.geminiQuota[k] = s.geminiQuota[k].replace(/[<>&]/g, '').slice(0, 40);
         }
     }
+    // v2.9.9：主题白名单（README 第 26 节宣称过、代码里一直没做）。
+    // setAttribute 本身不会注入，但非法主题会让面板整体退回兜底配色。
+    if (typeof s.theme !== 'string' || !TF_THEMES.includes(s.theme)) s.theme = defaultSettings.theme;
     return s;
 }
 
 /**
  * v2.9.7：导入专用的值级归一。顶层键已有白名单；这里管「合法键里的脏值」。
  * getSettings 的校验负责运行时兜底，这层负责导入当场把数据修齐。
+ * v2.9.9：扩到价格字段、dailyStats / history 的模型桶、模型桶里的 sources
+ * 子桶与 removedPresets —— 这些以前漏掉的值会算出 $NaN / 负金额。
  */
+
+/** 一张「模型名 → 桶」表的值级归一（stats / session / dailyStats / history 共用） */
+function tfNormalizeModelBuckets(models) {
+    if (!models || typeof models !== 'object') return;
+    for (const [k, m] of Object.entries(models)) {
+        if (!m || typeof m !== 'object' || TF_UNSAFE_KEYS.has(k)) { delete models[k]; continue; }
+        for (const f of ['in', 'out', 'cached', 'req', 'cost', 'est', 'unpriced']) m[f] = tfNum(m[f]);
+        if (m.sources && typeof m.sources === 'object' && !Array.isArray(m.sources)) {
+            for (const [sk, sub] of Object.entries(m.sources)) {
+                if (!sub || typeof sub !== 'object' || TF_UNSAFE_KEYS.has(sk)) { delete m.sources[sk]; continue; }
+                for (const f of ['in', 'out', 'cached', 'req', 'cost', 'est', 'unpriced']) sub[f] = tfNum(sub[f]);
+            }
+            // v2.9.9：导入也执行口径上限 —— 运行时写入有 TF_SOURCE_CAP，但导入是另一条
+            // 入口，一份大备份能把每桶的 sources 撑到无限（settings.json 膨胀）
+            const srcKeys = Object.keys(m.sources);
+            if (srcKeys.length > TF_SOURCE_CAP) {
+                const keep = new Set(srcKeys.slice(0, TF_SOURCE_CAP));
+                const other = (m.sources.other && typeof m.sources.other === 'object')
+                    ? m.sources.other
+                    : (m.sources.other = { in: 0, out: 0, cached: 0, req: 0, cost: 0, est: 0, unpriced: 0 });
+                for (const sk of srcKeys) {
+                    if (keep.has(sk) || sk === 'other') continue;
+                    const src = m.sources[sk];
+                    for (const f of ['in', 'out', 'cached', 'req', 'cost', 'est', 'unpriced']) {
+                        other[f] = tfNum(other[f]) + tfNum(src[f]);
+                    }
+                    delete m.sources[sk];
+                }
+            }
+        } else {
+            delete m.sources;
+        }
+    }
+}
+
 function tfNormalizeImportedSettings(s) {
     if (Array.isArray(s.models)) {
         s.models = s.models.filter((m) => m && typeof m === 'object' && typeof m.name === 'string')
-            .map((m) => ({ ...m }));
+            .map(tfCleanPrice);          // v2.9.9：价格字段一并归一
     }
+    if (!Array.isArray(s.removedPresets)) s.removedPresets = [];
+    s.removedPresets = s.removedPresets.filter((x) => typeof x === 'string').slice(0, 200);
     if (!Array.isArray(s.channels)) s.channels = [];
     s.channels = s.channels.filter((c) => c && typeof c === 'object' && typeof c.name === 'string' && Array.isArray(c.sources))
-        .map((c) => ({ name: String(c.name).slice(0, 40), sources: c.sources.filter((x) => typeof x === 'string').slice(0, 40) }));
+        .map((c) => ({
+            name: String(c.name).slice(0, 40),
+            sources: c.sources.filter((x) => typeof x === 'string').slice(0, 40),
+            // v2.9.9：保留「系统预填」标记，否则导入后官方渠道全显示「自建」
+            ...(c.builtin === true ? { builtin: true } : {}),
+        }));
     if (!Array.isArray(s.dayPatches)) s.dayPatches = [];
     s.dayPatches = s.dayPatches.filter((p) => p && typeof p === 'object' && p.channel && (p.date || p.from || p.to !== undefined))
         .slice(0, 500);
-    for (const b of ['stats', 'session']) {
-        if (s[b] && typeof s[b] === 'object' && s[b].models && typeof s[b].models === 'object') {
-            for (const [k, m] of Object.entries(s[b].models)) {
-                if (!m || typeof m !== 'object') { delete s[b].models[k]; continue; }
-                // __proto__ / constructor 这类键一律剔除（原型污染面收干净）
-                if (k === '__proto__' || k === 'constructor' || k === 'prototype') { delete s[b].models[k]; continue; }
-                for (const f of ['in', 'out', 'cached', 'req', 'cost', 'est', 'unpriced']) {
-                    const num = Number(m[f]);
-                    m[f] = Number.isFinite(num) && num >= 0 ? num : 0;
-                }
-            }
+    for (const b of ['stats', 'session', 'dailyStats']) {
+        if (s[b] && typeof s[b] === 'object') tfNormalizeModelBuckets(s[b].models);
+    }
+    // v2.9.9：dailyStats 的三个标量也要归一（此前只归了它的 models 桶）
+    if (s.dailyStats && typeof s.dailyStats === 'object') {
+        s.dailyStats.cost = tfNum(s.dailyStats.cost);
+        s.dailyStats.tokens = tfNum(s.dailyStats.tokens);
+        s.dailyStats.req = tfNum(s.dailyStats.req);
+        s.dailyStats.est = tfNum(s.dailyStats.est);
+    }
+    if (Array.isArray(s.history)) {
+        // 超长历史会让导入时的全量重算卡住界面；一份备份 5000 天已经是上限
+        s.history = s.history.filter((rec) => rec && typeof rec === 'object' && rec.date).slice(-5000);
+        for (const rec of s.history) {
+            rec.cost = tfNum(rec.cost);
+            rec.tokens = tfNum(rec.tokens);
+            rec.req = tfNum(rec.req);
+            if (rec.models) tfNormalizeModelBuckets(rec.models);
         }
     }
 }
@@ -261,11 +395,11 @@ function getPriceFor(settings, model) {
 
     // 1) 归一化后精确命中（去 vendor 前缀 / 日期尾巴 / preview 之类的装饰）
     for (const m of models) {
-        if (tfCanonicalModel(m.name) === key) return { ...m, matchedBy: 'exact', matchedName: m.name };
+        if (tfCanonicalModel(m.name) === key) return { ...tfCleanPrice(m), matchedBy: 'exact', matchedName: m.name };
     }
     // 2) 手动/自动别名
     for (const m of models) {
-        if (tfAliasList(m).includes(key)) return { ...m, matchedBy: 'alias', matchedName: m.name };
+        if (tfAliasList(m).includes(key)) return { ...tfCleanPrice(m), matchedBy: 'alias', matchedName: m.name };
     }
     // 3) 显著词相同（忽略版本词）：deepseek-flash -> deepseek-v4-flash
     //    同族有多个候选时标成 ambiguous，界面上会提示手动指定别名
@@ -287,18 +421,18 @@ function getPriceFor(settings, model) {
         }
     }
     if (tokenMatches.length === 1) {
-        return { ...tokenMatches[0], matchedBy: 'alias', matchedName: tokenMatches[0].name };
+        return { ...tfCleanPrice(tokenMatches[0]), matchedBy: 'alias', matchedName: tokenMatches[0].name };
     }
     if (tokenMatches.length > 1) {
         const shortest = tokenMatches.slice().sort((a, b) =>
             String(tfCanonicalModel(a.name)).length - String(tfCanonicalModel(b.name)).length)[0];
-        return { ...shortest, matchedBy: 'ambiguous', matchedName: shortest.name };
+        return { ...tfCleanPrice(shortest), matchedBy: 'ambiguous', matchedName: shortest.name };
     }
     // 4) 退化为包含匹配
     for (const m of models) {
         const name = tfCanonicalModel(m.name);
         if (!name) continue;
-        if (key.includes(name) || name.includes(key)) return { ...m, matchedBy: 'fuzzy', matchedName: m.name };
+        if (key.includes(name) || name.includes(key)) return { ...tfCleanPrice(m), matchedBy: 'fuzzy', matchedName: m.name };
     }
     return { ...TF_EMPTY_PRICE, name: model, matchedBy: 'none', matchedName: null };
 }
@@ -308,11 +442,13 @@ function getPriceFor(settings, model) {
  */
 function calcCost(settings, model, inTok, outTok, cachedTok, requests = 1) {
     const price = getPriceFor(settings, model);
+    // v2.9.9：入口再收一次口 —— 调用方可能拿着历史里存的脏数字进来（字符串/NaN）
+    const i = tfNum(inTok), o = tfNum(outTok), c = tfNum(cachedTok), r = tfNum(requests);
     const tokenCost =
-        (inTok / 1e6) * (price.input || 0) +
-        (outTok / 1e6) * (price.output || 0) +
-        (cachedTok / 1e6) * (price.cached || 0);
-    const reqCost = (price.perRequest || 0) * requests;
+        (i / 1e6) * (price.input || 0) +
+        (o / 1e6) * (price.output || 0) +
+        (c / 1e6) * (price.cached || 0);
+    const reqCost = (price.perRequest || 0) * r;
     const rawUsd = tokenCost + reqCost;
     const mult = (typeof price.multiplier === 'number' && price.multiplier > 0) ? price.multiplier : 1;
     const usd = rawUsd * mult;
@@ -367,22 +503,24 @@ function tfAccumulateSource(m, sourceKey, inTok, outTok, cachedTok, requests, co
     // v2.9.7：口径键同受原型污染防护
     if (!sourceKey || !m || !tfSafeKey(sourceKey)) return;
     if (!m.sources || typeof m.sources !== 'object') m.sources = {};
-    // v2.9.7：兑现方案稿承诺 —— 每个模型桶最多 20 个口径，超出并入「其他」，
-    // 这是导入路径之外唯一能无限撑大 settings.json 的口子
+    // v2.9.7/2.9.9：兑现方案稿承诺 —— 每个模型桶最多 TF_SOURCE_CAP 个真实口径，
+    // 超出的并入 other（other 自己占一个额外槽位）。旧版在别的判断里直接 return，
+    // 于是满 20 后的用量既没进 other 也没进任何子桶 —— 渠道视图只剩「未知」。
+    // 这里也是导入路径之外唯一能无限撑大 settings.json 的口子，所以必须封顶。
     if (m.sources[sourceKey] === undefined && Object.keys(m.sources).length >= TF_SOURCE_CAP) {
         sourceKey = 'other';
-        if (m.sources[sourceKey] === undefined && Object.keys(m.sources).length >= TF_SOURCE_CAP) return;
     }
     const sub = (typeof m.sources[sourceKey] === 'object' && m.sources[sourceKey])
         ? m.sources[sourceKey]
         : (m.sources[sourceKey] = { in: 0, out: 0, cached: 0, req: 0, cost: 0, est: 0, unpriced: 0 });
-    sub.in += inTok || 0;
-    sub.out += outTok || 0;
-    sub.cached += cachedTok || 0;
-    sub.req += requests || 0;
-    sub.cost += costUsd || 0;
-    if (isEstimate) sub.est = (sub.est || 0) + 1;
-    if (unpriced) sub.unpriced = (sub.unpriced || 0) + 1;
+    // v2.9.9：累加前统一归一，字符串型 token 不会把桶拼成 "01000200"
+    sub.in += tfNum(inTok);
+    sub.out += tfNum(outTok);
+    sub.cached += tfNum(cachedTok);
+    sub.req += tfNum(requests);
+    sub.cost += tfNum(costUsd);
+    if (isEstimate) sub.est = tfNum(sub.est) + 1;
+    if (unpriced) sub.unpriced = tfNum(sub.unpriced) + 1;
 }
 
 /** v2.9.7：外部字符串当对象键的统一防护 —— 这三个名字会命中 Object 键语义
@@ -403,56 +541,59 @@ function recordUsage(model, inTok, outTok, cachedTok, isEstimate, requests = 1, 
     // 旧版会写进全局原型（账目还蒸发），现在并入 unknown
     let key = tfSafeKey(model) || 'unknown';
     if (sourceKey && !tfSafeKey(sourceKey)) sourceKey = 'unknown-source';
-    const cost = calcCost(s, key, inTok, outTok, cachedTok, requests);
+    // v2.9.9：上游可能给字符串型 token；算术之前全部归一，避免字符串拼接
+    const iTok = tfNum(inTok), oTok = tfNum(outTok), cTok = tfNum(cachedTok), reqCount = tfNum(requests);
+    const cost = calcCost(s, key, iTok, oTok, cTok, reqCount);
     const unpricedHit = !!(cost.price && cost.price.matchedBy === 'none');
 
     for (const bucketName of ['stats', 'session']) {
         const bucket = s[bucketName];
-        if (!bucket.models[key]) {
+        // v2.9.9：桶本身也可能是脏值（手改 settings 里混进数字）——旧版会当场抛 TypeError
+        if (!bucket.models[key] || typeof bucket.models[key] !== 'object') {
             bucket.models[key] = { in: 0, out: 0, cached: 0, req: 0, cost: 0, est: 0, unpriced: 0 };
         }
         const m = bucket.models[key];
-        m.in += inTok || 0;
-        m.out += outTok || 0;
-        m.cached += cachedTok || 0;
-        m.req += requests;
-        if (isEstimate) m.est += 1;
+        m.in = tfNum(m.in) + iTok;
+        m.out = tfNum(m.out) + oTok;
+        m.cached = tfNum(m.cached) + cTok;
+        m.req = tfNum(m.req) + reqCount;
+        if (isEstimate) m.est = tfNum(m.est) + 1;
 
-        m.cost += cost.usd;
-        if (unpricedHit) m.unpriced = (m.unpriced || 0) + 1;
+        m.cost = tfNum(m.cost) + cost.usd;
+        if (unpricedHit) m.unpriced = tfNum(m.unpriced) + 1;
         if (cost.price && cost.price.matchedBy === 'fuzzy') m.fuzzyMatched = cost.price.matchedName || '';
 
         // v2.9.0 渠道分桶：同一模型走不同口子时，费用/用量按口径拆开
-        tfAccumulateSource(m, sourceKey, inTok, outTok, cachedTok, requests, cost.usd, isEstimate, unpricedHit);
+        tfAccumulateSource(m, sourceKey, iTok, oTok, cTok, reqCount, cost.usd, isEstimate, unpricedHit);
 
-        bucket.totalTokens = (bucket.totalTokens || 0) + (inTok || 0) + (outTok || 0) + (cachedTok || 0);
-        bucket.totalRequests = (bucket.totalRequests || 0) + requests;
-        bucket.totalCost = (bucket.totalCost || 0) + cost.usd;
+        bucket.totalTokens = tfNum(bucket.totalTokens) + iTok + oTok + cTok;
+        bucket.totalRequests = tfNum(bucket.totalRequests) + reqCount;
+        bucket.totalCost = tfNum(bucket.totalCost) + cost.usd;
     }
 
     if (cost.price && cost.price.matchedBy === 'none') tfNotifyUnpricedModel(key, s);
-    recordRPM(s, requests);
-    recordDailyUsage(s, cost.usd, inTok + outTok + cachedTok, requests, isEstimate);
+    recordRPM(s, reqCount);
+    recordDailyUsage(s, cost.usd, iTok + oTok + cTok, reqCount, isEstimate);
     // 按模型累计到当天：补上单价后，今日费用与历史归档都能被重算
     if (!s.dailyStats.models || typeof s.dailyStats.models !== 'object') s.dailyStats.models = {};
-    if (!s.dailyStats.models[key]) {
+    if (!s.dailyStats.models[key] || typeof s.dailyStats.models[key] !== 'object') {
         // 字段要和 stats / session 的桶保持一致：之前这里漏了 est / unpriced，
         // 导致「含估算」在 今天 / 7 天 / 30 天 视图里永远是 0（只有「全部」是对的）
         s.dailyStats.models[key] = { in: 0, out: 0, cached: 0, req: 0, cost: 0, est: 0, unpriced: 0 };
     }
     const dailyModel = s.dailyStats.models[key];
-    dailyModel.in += inTok || 0;
-    dailyModel.out += outTok || 0;
-    dailyModel.cached += cachedTok || 0;
-    dailyModel.req += requests;
+    dailyModel.in = tfNum(dailyModel.in) + iTok;
+    dailyModel.out = tfNum(dailyModel.out) + oTok;
+    dailyModel.cached = tfNum(dailyModel.cached) + cTok;
+    dailyModel.req = tfNum(dailyModel.req) + reqCount;
     // 费用必须一起累加：之前这里只加了 in/out/cached/req/est/unpriced，
     // 漏了 cost，于是「今天」的按模型费用恒为 0 —— 当天明细全是 $0，
     // 而且 近7天/近30天 的合计会整块少算今天这一天的钱。
-    dailyModel.cost = (dailyModel.cost || 0) + cost.usd;
-    if (isEstimate) dailyModel.est = (dailyModel.est || 0) + 1;
-    if (cost.price && cost.price.matchedBy === 'none') dailyModel.unpriced = (dailyModel.unpriced || 0) + 1;
+    dailyModel.cost = tfNum(dailyModel.cost) + cost.usd;
+    if (isEstimate) dailyModel.est = tfNum(dailyModel.est) + 1;
+    if (cost.price && cost.price.matchedBy === 'none') dailyModel.unpriced = tfNum(dailyModel.unpriced) + 1;
     // v2.9.0 渠道分桶（今日）：maybeArchive 快照 dailyStats.models 时会连 sources 一起归档
-    tfAccumulateSource(dailyModel, sourceKey, inTok, outTok, cachedTok, requests, cost.usd, isEstimate, unpricedHit);
+    tfAccumulateSource(dailyModel, sourceKey, iTok, oTok, cTok, reqCount, cost.usd, isEstimate, unpricedHit);
     checkBudgetAlert(s, cost.usd);
     maybeArchive(s);
 
@@ -516,15 +657,17 @@ function recordRPM(s, requests = 1) {
 // 每日统计：按自然日累积
 function recordDailyUsage(s, costUsd, tokens, req, isEstimate) {
     if (!s.dailyStats || typeof s.dailyStats !== 'object') s.dailyStats = { cost: 0, tokens: 0, req: 0 };
-    s.dailyStats.cost = (s.dailyStats.cost || 0) + costUsd;
-    s.dailyStats.tokens = (s.dailyStats.tokens || 0) + (tokens || 0);
-    s.dailyStats.req = (s.dailyStats.req || 0) + (req || 0);
+    // v2.9.9：四个标量全部归一 —— 导入/手改的字符串会让 "abc" + 0.003 拼成字符串，
+    // 今日费用与预算预警会一起静默失效
+    s.dailyStats.cost = tfNum(s.dailyStats.cost) + tfNum(costUsd);
+    s.dailyStats.tokens = tfNum(s.dailyStats.tokens) + tfNum(tokens);
+    s.dailyStats.req = tfNum(s.dailyStats.req) + tfNum(req);
     // 会话开始日期追踪（用于换天重置）
     s.dailyStats.date = s.dailyStats.date || _todayStr();
     if (s.dailyStats.date !== _todayStr()) {
-        s.dailyStats = { cost: costUsd, tokens: tokens || 0, req: req || 0, date: _todayStr(), est: isEstimate ? 1 : 0 };
+        s.dailyStats = { cost: tfNum(costUsd), tokens: tfNum(tokens), req: tfNum(req), date: _todayStr(), est: isEstimate ? 1 : 0 };
     } else if (isEstimate) {
-        s.dailyStats.est = (s.dailyStats.est || 0) + 1;
+        s.dailyStats.est = tfNum(s.dailyStats.est) + 1;
     }
 }
 
@@ -704,8 +847,10 @@ function extractUsageFromBody(body) {
         ? Math.max(0, rawPrompt - cacheRead)
         : rawPrompt + cacheWrite;
     const inSafe = num(inUncached);
-    const totalTok = num(usage.total_tokens) || (inSafe + outTok + cacheRead);
-    if (!totalTok && !inSafe && !outTok) return null;
+    // v2.9.9：只有 total_tokens 的响应归不出输入/输出/缓存三项。旧版靠 total_tokens
+    // 通过守卫，然后记成 0/0/0 的「真实用量」——既丢了 token，也把估算兜底挡掉了。
+    // 现在这种响应返回 null，交给估算兜底（面板会标「含估算」），不再记假精确账。
+    if (!inSafe && !outTok && !cacheRead) return null;
     return { in: inSafe, out: outTok, cached: cacheRead };
 }
 
@@ -1210,8 +1355,12 @@ function finishFromBody(capture, json, layer) {
     if (err) { finishCapture(capture, { reason: layer + '里返回了错误: ' + err, estimate: false }); return; }
 
     const outputText = extractOutputTextFromBody(json);
-    // 既不是完成响应、又抠不出正文 → 这次请求没产出东西，不能凭空估算
-    if (!outputText && !hasCompletionShape(json)) {
+    // v2.9.9：响应里带 usage 对象（哪怕只有 total_tokens、归不出输入/输出/缓存三项）
+    // 说明请求确实完成了 —— 这种不算「未捕获」，交给估算兜底（面板标「含估算」），
+    // 保住请求数与按次计价；旧版会把它记成 0/0/0 的「精确」账。
+    const hadUsageObject = !!(json && json.usage);
+    // 既不是完成响应、又抠不出正文、也没有 usage → 这次请求没产出东西，不能凭空估算
+    if (!outputText && !hasCompletionShape(json) && !hadUsageObject) {
         const hint = [json && json.message, json && json.msg, json && json.detail, json && json.code]
             .filter((v) => v != null && v !== '').join(' / ').slice(0, 120);
         finishCapture(capture, {
@@ -2015,7 +2164,7 @@ function updateDashboard() {
  *  v1.3.0 · Gemini「用量限额」一比一还原
  * ============================================================ */
 // 计算当日周期内的用量（按当前 metric）
-function quotaMetricUsage(s, windowStartTs) {
+function quotaMetricUsage(s) {
     const metric = (s.geminiQuota && s.geminiQuota.metric) || 'tokens';
     // 隔夜后 dailyStats 里还是昨天的数，不能当「今天」用
     const d = tfTodayStats(s);
@@ -2035,59 +2184,40 @@ function quotaWeeklyUsage(s) {
             if (!h || !h.date || h.date === todayKey) continue;  // 今天用 dailyStats 计
             const t = new Date(h.date + 'T00:00:00').getTime();
             if (t >= weekStart) {
-                if (metric === 'cost') sum += h.cost || 0;
-                else if (metric === 'requests') sum += h.req || 0;
-                else sum += h.tokens || 0;
+                // v2.9.9：归一后再加 —— 手改 settings 里的字符串成本不会把 sum 拼成字符串
+                if (metric === 'cost') sum += tfNum(h.cost);
+                else if (metric === 'requests') sum += tfNum(h.req);
+                else sum += tfNum(h.tokens);
             }
         }
     }
     const d = tfTodayStats(s);   // 隔夜后 dailyStats 里还是昨天的数，不能当「今天」用
-    sum += (metric === 'cost') ? (d.cost || 0)
-        : (metric === 'requests') ? (d.req || 0) : (d.tokens || 0);
+    sum += (metric === 'cost') ? tfNum(d.cost)
+        : (metric === 'requests') ? tfNum(d.req) : tfNum(d.tokens);
     return sum;
 }
 
-// 计算本周起始时间戳（基于 weeklyResetDay/weeklyResetTime）
+// 计算本周起始时间戳。v2.9.9：窗口按「天」对齐到 weeklyResetDay 的 00:00。
+// 归档只有天粒度，旧版拿 12:19 这种时刻当窗口起点，会让重置日当天的用量
+// 要么整块丢掉（今天不是重置日）要么整块算进（今天是重置日）——半天边界必错。
+// 按天对齐后窗口与存储粒度一致：重置日那天的整天都属于本窗口。
 function weeklyResetMillis(s) {
     const cfg = s.geminiQuota || {};
     const day = (cfg.weeklyResetDay == null) ? 4 : (cfg.weeklyResetDay % 7);
-    const wt = parseHM(cfg.weeklyResetTime || '12:19');
     const now = new Date();
     const m = new Date(now);
     m.setHours(0, 0, 0, 0);
-    // 本周已过天数
-    let diff = (now.getDay() - day + 7) % 7;
+    // 本周已过天数（今天就是重置日时为 0）
+    const diff = (now.getDay() - day + 7) % 7;
     m.setDate(m.getDate() - diff);
-    m.setHours(wt.h, wt.m, 0, 0);   // 旧版误用 setMinutes，且从未设置小时
-    // 如果起始时间在未来，回退到上周
-    if (m.getTime() > now.getTime()) m.setDate(m.getDate() - 7);
     return m.getTime();
 }
-// "HH:MM" -> { h, m }
-function parseHM(str) {
-    const [h, m] = String(str || '0:0').split(':');
-    return { h: parseInt(h, 10) || 0, m: parseInt(m, 10) || 0 };
-}
-// 计算今日重置时刻（基于 dailyResetTime）
-function dailyResetMillis(s) {
-    const cfg = s.geminiQuota || {};
-    const t = (cfg.dailyResetTime || '17:19').split(':');
-    const m = new Date();
-    m.setHours(parseInt(t[0], 10) || 0, parseInt(t[1], 10) || 0, 0, 0);
-    return m.getTime();
-}
+// v2.9.9：日/周窗口都按天对齐，界面不再显示不参与计算的时刻
+// （dailyResetTime / weeklyResetTime 已无编辑入口，也不再影响任何计算，仅作兼容字段保留）
 function fmtClock(s, mode) {
+    if (mode === 'daily') return '00:00';
     const cfg = s.geminiQuota || {};
-    let h, min, day;
-    if (mode === 'daily') {
-        const t = (cfg.dailyResetTime || '17:19').split(':');
-        h = t[0]; min = t[1];
-        return `${h}:${min}`;
-    } else {
-        const t = (cfg.weeklyResetTime || '12:19').split(':');
-        day = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][(cfg.weeklyResetDay == null ? 4 : cfg.weeklyResetDay % 7)];
-        return `${day} ${t[0]}:${t[1]}`;
-    }
+    return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][(cfg.weeklyResetDay == null ? 4 : cfg.weeklyResetDay % 7)];
 }
 
 // 渲染环形进度 SVG
@@ -2113,7 +2243,7 @@ function quotaRingHTML(pct, used, limit, label, mode, s) {
             <div class="tf-ring-meta">
                 <div class="tf-ring-label">${tfEscapeHtml(label)}</div>
                 <div class="tf-ring-desc">${tfEscapeHtml(usedStr)}</div>
-                <div class="tf-ring-reset">🔄 ${safeT('重置')} · ${mode === 'daily' ? '00:00' : tfEscapeHtml(fmtClock(s, mode))}</div>
+                <div class="tf-ring-reset">🔄 ${safeT('重置')} · ${tfEscapeHtml(fmtClock(s, mode))}</div>
             </div>
         </div>`;
 }
@@ -2150,7 +2280,7 @@ function renderGeminiQuota(el, s) {
         rings.className = 'tf-quota-ring-wrap';
 
         const dailyLimit = cfg.dailyLimit || 0;
-        const dailyUsed = quotaMetricUsage(s, dailyResetMillis(s));
+        const dailyUsed = quotaMetricUsage(s);
         const dPct = dailyLimit > 0 ? (dailyUsed / dailyLimit) * 100 : 0;
         rings.innerHTML = quotaRingHTML(dPct, dailyUsed, dailyLimit, safeT('当前用量'), 'daily', s);
 
@@ -2677,7 +2807,7 @@ function ensureFloatingUI() {
                     <div class="tf-theme-switcher" id="token_flow_theme_switcher" title="${safeT('主题')}">
                         <button class="tf-theme-switch-btn menu_button" type="button" title="${safeT('切换主题')}"><i class="fa-solid fa-palette"></i></button>
                         <div class="tf-theme-menu" id="token_flow_theme_menu">
-                            ${['cyber-royal','ink-zen','aurora-midnight','molten-gold','mono-white'].map(id =>
+                            ${TF_THEMES.map(id =>
                                 `<button type="button" class="tf-theme-menu-item" data-theme-id="${id}" data-theme-name="${safeT(themeNameOf(id))}">${safeT(themeNameOf(id))}</button>`
                             ).join('')}
                         </div>
@@ -2707,11 +2837,21 @@ function ensureFloatingUI() {
     (document.documentElement || document.body).appendChild(fragment);
 
     const orb = document.getElementById('token_flow_orb');
+    // v2.9.9：showOrb=false 时悬浮球本来就不该存在。设置页那个「打开统计面板」
+    // 按钮会临时把它建出来，这里保证建出来也是隐藏的（面板自己能独立打开）。
+    if (orb && getSettings().showOrb === false) orb.style.display = 'none';
     const panel = document.getElementById('token_flow_panel');
     const scrim = document.getElementById('token_flow_panel_scrim');
     const closeBtn = document.getElementById('token_flow_panel_close');
     const refreshBtn = document.getElementById('token_flow_manual_refresh') || document.getElementById('token_flow_refresh');
     const resetBtn = document.getElementById('token_flow_reset_session');
+    // v2.9.9：宿主把 innerHTML 段过滤掉 / 别的扩展把元素移除时，getElementById 会拿到
+    // null，后面一连串 addEventListener 会连环抛错，日志里只剩一句看不懂的 TypeError。
+    // 在这里一次性判掉，失败原因写进运行日志（面板上没有 DevTools 的设备也能自查）。
+    if (!orb || !panel || !scrim) {
+        tfLog('error', 'ui.orb', '悬浮球/面板元素创建失败（DOM 被宿主过滤或移除）');
+        return false;
+    }
 
     // 恢复悬浮球位置：比例 -> 当前屏幕安全区内的像素
     // （旧版直接写像素，从宽屏同步到手机时球会被画到屏幕外，真机上就是"消失"）
@@ -2865,9 +3005,6 @@ function ensureFloatingUI() {
             s.theme = item.getAttribute('data-theme-id') || s.theme;
             applyTheme();
             saveSettingsDebounced();
-            document.querySelectorAll('#token_flow_drawer .tf-theme-chip').forEach(c => {
-                c.classList.toggle('active', c.getAttribute('data-theme') === s.theme);
-            });
             themeMenu.classList.remove('open');
         });
         document.addEventListener('click', (e) => {
@@ -3086,9 +3223,27 @@ function addExtensionSettingsInto(content) {
             safeUpdateUI();
         } else {
             // v2.9.7（审查 P3）：showOrb=false 时面板根本没创建，旧版静默跳过 ——
-            // 按钮按了没反应像坏了。给一句可见提示，并当场把悬浮球建出来。
-            tfNotify(safeT('还没开启悬浮球 —— 已为你创建，现在可以打开了'));
-            try { ensureFloatingUI(); safeUpdateUI(); } catch { /* 创建失败时保持提示即可 */ }
+            // 按钮按了没反应像坏了。
+            // v2.9.9：改成真的把面板打开（创建 + 直接展开），而不是只建个球让用户
+            // 自己去找；悬浮球由 showOrb 决定隐藏与否，这个按钮不改用户的开关，
+            // 刷新后按钮照样能用。
+            try {
+                ensureFloatingUI();
+                const p2 = document.getElementById('token_flow_panel');
+                const s2 = document.getElementById('token_flow_panel_scrim');
+                const o2 = document.getElementById('token_flow_orb');
+                if (p2 && s2) {
+                    p2.style.display = 'flex';
+                    s2.style.display = 'block';
+                    o2?.classList.add('is-open');
+                    safeUpdateUI();
+                } else {
+                    tfNotify(safeT('打不开统计面板 —— 请刷新页面重试'));
+                }
+            } catch (e) {
+                tfLog('error', 'ui.panel', '创建统计面板失败: ' + (e?.message || e));
+                tfNotify(safeT('打不开统计面板 —— 请刷新页面重试'));
+            }
         }
     });
     openBtnRow.appendChild(openBtn);
@@ -3135,7 +3290,11 @@ function addExtensionSettingsInto(content) {
                 inp.value = m[f];
                 inp.addEventListener('input', () => {
                     const v = parseFloat(inp.value);
-                    m[f] = isNaN(v) ? 0 : v;
+                    // v2.9.9：负价/非数字一律当 0，并同步回输入框 —— 否则会出现
+                    // 「框里显示 -5、实际按 0 算」这种表里不一
+                    const ok = Number.isFinite(v) && v > 0;
+                    m[f] = ok ? v : 0;
+                    if (!ok && inp.value !== '') inp.value = '0';
                     m.userEdited = true;
                     onPricesChanged();
                 });
@@ -3184,6 +3343,16 @@ function addExtensionSettingsInto(content) {
             delBtn.className = 'tf-del';
             delBtn.addEventListener('click', () => {
                 if (s.models.length <= 1) return;
+                // v2.9.9：删掉的要是内置预设，记进 removedPresets —— 否则 getSettings
+                // 的「补旗舰」逻辑下一次读取就把它加回来，删除按钮等于没用
+                const gone = s.models[i];
+                const goneKey = gone && tfCanonicalModel(gone.name);
+                const hit = goneKey && PRESET_MODELS.find((p) => tfCanonicalModel(p.name) === goneKey);
+                if (hit) {
+                    if (!Array.isArray(s.removedPresets)) s.removedPresets = [];
+                    const lk = String(hit.name).toLowerCase();
+                    if (!s.removedPresets.includes(lk)) s.removedPresets.push(lk);
+                }
                 s.models.splice(i, 1);
                 onPricesChanged(); renderRows();
             });
@@ -3276,12 +3445,12 @@ function addExtensionSettingsInto(content) {
     row(span(safeT('今日限额 ($/1M)')),
         makeInput('tf_budget_daily', 'number', s.budget && s.budget.dailyLimit, () => {
             const v = parseFloat(document.getElementById('tf_budget_daily').value);
-            s.budget.dailyLimit = isNaN(v) ? 0 : v; saveSettingsDebounced(); updateOrbBadge(); updateDashboard();
+            s.budget.dailyLimit = Number.isFinite(v) && v > 0 ? v : 0; saveSettingsDebounced(); updateOrbBadge(); updateDashboard();
         }));
     row(span(safeT('月度限额 ($/1M)')),
         makeInput('tf_budget_monthly', 'number', s.budget && s.budget.monthlyLimit, () => {
             const v = parseFloat(document.getElementById('tf_budget_monthly').value);
-            s.budget.monthlyLimit = isNaN(v) ? 0 : v; saveSettingsDebounced(); updateOrbBadge(); updateDashboard();
+            s.budget.monthlyLimit = Number.isFinite(v) && v > 0 ? v : 0; saveSettingsDebounced(); updateOrbBadge(); updateDashboard();
         }));
 
     // ============ v1.1.0 新增配置：上下文监控 ============
@@ -3362,6 +3531,11 @@ function addExtensionSettingsInto(content) {
                             safeIncoming[key] = incoming[key];
                         }
                         Object.assign(extension_settings[MODULE], safeIncoming);
+                        // v2.9.9：老备份里没有 removedPresets 时清掉本会话的黑名单 ——
+                        // 否则「整块覆盖」之后，之前删过的预设仍不会被补旗舰补回
+                        if (!Object.prototype.hasOwnProperty.call(safeIncoming, 'removedPresets')) {
+                            delete extension_settings[MODULE].removedPresets;
+                        }
                         const imported = getSettings();
                         if (typeof imported.displayCurrency === 'string') imported.displayCurrency = imported.displayCurrency.slice(0, 8);
                         if (!Array.isArray(imported.models)) imported.models = structuredClone(PRESET_MODELS);
@@ -3486,7 +3660,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.9.8';
+const TF_VERSION = '2.9.9';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
@@ -3622,13 +3796,13 @@ function tfCopy(text, okMessage) {
  *       不是记下来就固定死。今日与历史归档同样保存了按模型用量。
  * ============================================================ */
 
-const TF_PRICE_FIELDS = ['input', 'output', 'cached', 'perRequest'];
-
 function priceHasValue(price) {
     if (!price) return false;
     // v2.9.7：改成「非零即有价值」—— 旧判据 >0 会把「全负价」判成未定价，
     // 界面列它未定价、重算却按负价扣钱，两处口径不一致。
-    return TF_PRICE_FIELDS.some((field) => Number(price[field] || 0) !== 0);
+    // v2.9.9：判据统一走 tfNum —— NaN/Infinity/负价都在 getSettings/getPriceFor
+    // 里被归一为 0，所以这里等价于「有一个正的单价」，负价不会再扣出负金额。
+    return TF_PRICE_FIELDS.some((field) => tfNum(price[field]) > 0);
 }
 
 /** 用量已经记下、但没有任何可用单价的模型 —— 这些模型的费用目前是 0 */
@@ -3645,8 +3819,8 @@ function collectUnpricedModels(s) {
             seen.add(key);
             out.push({
                 name: key,
-                tokens: (m.in || 0) + (m.out || 0) + (m.cached || 0),
-                req: m.req || 0,
+                tokens: tfNum(m.in) + tfNum(m.out) + tfNum(m.cached),
+                req: tfNum(m.req),
             });
         }
     }
@@ -3677,6 +3851,12 @@ function recomputeBucketCost(s, models) {
         // v2.9.7：类型防护——导入的 stats.models 值可能是数字/字符串，
         // 旧版在严格模式下给原始值赋属性会抛 TypeError（半导入）
         if (!m || typeof m !== 'object') continue;
+        // v2.9.9：就地归一存储值（不换对象），把导入/手改带来的脏数字修回真值，
+        // 以后图表明细不会再出现 $NaN。归一在重算时顺带完成，不需要单独的迁移。
+        m.in = tfNum(m.in);
+        m.out = tfNum(m.out);
+        m.cached = tfNum(m.cached);
+        m.req = tfNum(m.req);
         const price = getPriceFor(s, key);
         // v2.9.7：保护放宽到「整条价格全 0」—— 一键补入的 0 价条目也算精确命中，
         // 旧版保护只认 matchedBy==='none'，于是补价立刻把已记录费用显示清零
@@ -3685,17 +3865,22 @@ function recomputeBucketCost(s, models) {
         if (!usable) {
             // 没有可用价格时保留原值：旧版会把它重算成 0，
             // 于是删一条价格就能让历史成本静默归零
-            total += m.cost || 0;
+            m.cost = tfNum(m.cost);
+            total += m.cost;
             continue;
         }
-        const cost = calcCost(s, key, m.in || 0, m.out || 0, m.cached || 0, m.req || 0);
+        const cost = calcCost(s, key, m.in, m.out, m.cached, m.req);
         m.cost = cost.usd;
         // v2.9.7 渠道修复 1a：按渠道视图直接读 sources 子桶的 cost，
         // 旧版只回写模型桶 —— 补价后子桶留着旧价，渠道合计 ≠ 页头合计。
         if (m.sources && typeof m.sources === 'object') {
             for (const sub of Object.values(m.sources)) {
                 if (!sub || typeof sub !== 'object') continue;
-                sub.cost = calcCost(s, key, sub.in || 0, sub.out || 0, sub.cached || 0, sub.req || 0).usd;
+                sub.in = tfNum(sub.in);
+                sub.out = tfNum(sub.out);
+                sub.cached = tfNum(sub.cached);
+                sub.req = tfNum(sub.req);
+                sub.cost = calcCost(s, key, sub.in, sub.out, sub.cached, sub.req).usd;
             }
         }
         total += cost.usd;
@@ -3967,9 +4152,27 @@ function renderModelsSub(container, s) {
         safeUpdateUI();
     }, 'tf-diag-btn'));
     footer.appendChild(tfButton(safeT('保存并重算'), () => {
+        // v2.9.9：草稿里被删掉的内置预设要记进 removedPresets，否则保存后
+        // getSettings 的「补旗舰」逻辑会把它加回来（设置区 ✕ 那条路径已在删除时记录）
+        const prev = Array.isArray(s.models) ? s.models : [];
+        const draft = Array.isArray(tfPriceDraft) ? tfPriceDraft : [];
+        const canon = (arr) => new Set(arr.filter((m) => m && m.name).map((m) => tfCanonicalModel(m.name)));
+        const prevSet = canon(prev);
+        const draftSet = canon(draft);
+        for (const p of PRESET_MODELS) {
+            const key = String(p.name).toLowerCase();
+            if (prevSet.has(tfCanonicalModel(p.name)) && !draftSet.has(tfCanonicalModel(p.name))) {
+                if (!Array.isArray(s.removedPresets)) s.removedPresets = [];
+                if (!s.removedPresets.includes(key)) s.removedPresets.push(key);
+            }
+        }
         s.models = tfPriceDraft;
         tfPriceDraft = null;
         tfManageOnlyUnpriced = false;
+        // v2.9.9：草稿保存后，设置区那张价格表的行闭包还握着草稿之前的对象
+        // （点保存等于把 s.models 换成了一批副本）—— 不重绘的话，那几行改价会写进
+        // 孤儿对象、✕ 还会按旧索引删错行。这里必须重建一次行。
+        try { if (typeof tfRefreshPriceTableRows === 'function') tfRefreshPriceTableRows(); } catch { /* 表格没渲染时跳过 */ }
         onPricesChanged();
         tfNotify(safeT('已保存，费用已按新价格重算'));
     }));
@@ -4617,14 +4820,15 @@ function tfNewBucket() {
 }
 
 function tfAccumulate(bucket, src, rawName) {
-    bucket.in += src.in || 0;
-    bucket.out += src.out || 0;
-    bucket.cached += src.cached || 0;
-    bucket.req += src.req || 0;
-    bucket.cost += src.cost || 0;
-    bucket.est += src.est || 0;
-    bucket.unpriced += src.unpriced || 0;
-    if (rawName) bucket.rawNames[rawName] = (bucket.rawNames[rawName] || 0) + (src.req || 0);
+    // v2.9.9：归一后再累加 —— 脏桶值（字符串/NaN）不会再污染合计与图表
+    bucket.in += tfNum(src.in);
+    bucket.out += tfNum(src.out);
+    bucket.cached += tfNum(src.cached);
+    bucket.req += tfNum(src.req);
+    bucket.cost += tfNum(src.cost);
+    bucket.est += tfNum(src.est);
+    bucket.unpriced += tfNum(src.unpriced);
+    if (rawName) bucket.rawNames[rawName] = tfNum(bucket.rawNames[rawName]) + tfNum(src.req);
     return bucket;
 }
 
@@ -4717,11 +4921,14 @@ function tfAggregateRange(s, range) {
             for (const k of keys) {
                 const sub = entry.sources[k];
                 if (!sub || typeof sub !== 'object') continue;
-                for (const f of Object.keys(sum)) sum[f] += sub[f] || 0;
-                pushChannel(tfChannelOfSource(s, k) || safeT('未归类'), sub);
+                for (const f of Object.keys(sum)) sum[f] += tfNum(sub[f]);
+                // v2.9.9：口径满 20 后溢出的都并进 other —— 给个能看懂的标签，
+                // 否则它们会混在「未归类」里，看不出是「超出上限被合并」的
+                const label = tfChannelOfSource(s, k) || (k === 'other' ? safeT('其他口径（超出上限）') : safeT('未归类'));
+                pushChannel(label, sub);
             }
             for (const f of Object.keys(sum)) {
-                const rem = (entry[f] || 0) - (sum[f] || 0);
+                const rem = tfNum(entry[f]) - sum[f];
                 if (rem > 0) { rest = rest || { in: 0, out: 0, cached: 0, req: 0, cost: 0, est: 0, unpriced: 0 }; rest[f] = rem; }
             }
             if (rest) pushChannel(safeT('未知（旧记录）'), rest);
@@ -4795,10 +5002,11 @@ function tfAggregateRange(s, range) {
                 // 老条目只有总量、没有按模型明细：单独计数。
                 // 不能塞进「输入」里 —— 那会把输入抬高、把命中率压低。
                 summary.legacyDays += 1;
-                summary.legacyCost += rec.cost || 0;
-                summary.legacyTokens += rec.tokens || 0;
-                summary.cost += rec.cost || 0;
-                summary.req += rec.req || 0;
+                // v2.9.9：归一再累加（老条目没经过模型桶归一）
+                summary.legacyCost += tfNum(rec.cost);
+                summary.legacyTokens += tfNum(rec.tokens);
+                summary.cost += tfNum(rec.cost);
+                summary.req += tfNum(rec.req);
             }
         }
     }
@@ -4807,8 +5015,8 @@ function tfAggregateRange(s, range) {
         const rec = dayMap.get(date);
         return {
             date,
-            cost: rec ? (rec.cost || 0) : 0,
-            tokens: rec ? (rec.tokens || 0) : 0,
+            cost: rec ? tfNum(rec.cost) : 0,
+            tokens: rec ? tfNum(rec.tokens) : 0,
             req: (rec && rec.req) || 0,
             models: (rec && rec.models) || {},
         };
@@ -5137,8 +5345,8 @@ let tfPatchListOpen = false;   // v2.9.8：渠道子页补丁清单默认收起
             for (const [sk, sv] of Object.entries(m.sources)) {
                 if (!sk || typeof sv !== 'object' || !sv) continue;
                 const agg = seen.get(sk) || { req: 0, tokens: 0 };
-                agg.req += sv.req || 0;
-                agg.tokens += (sv.in || 0) + (sv.out || 0) + (sv.cached || 0);
+                agg.req += tfNum(sv.req);
+                agg.tokens += tfNum(sv.in) + tfNum(sv.out) + tfNum(sv.cached);
                 seen.set(sk, agg);
             }
         }

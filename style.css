@@ -95,7 +95,11 @@
 }
 
 .tf-dash-muted {
-    opacity: 0.5;
+    /* v2.9.9：原来 opacity:.5 在浅色主题只有 3.05:1（低于 4.5:1）。这里改用
+       更高的不透明度（.75，实测浅色面板底 6.17–6.54:1），而不是换成某个主题实色：
+       这个占位块所在的容器背景不总跟扩展主题走，实色会在「深色主题 + 浅色宿主」
+       下反而更差；用 opacity 跟父级文字同源，混色方向始终一致。 */
+    opacity: 0.75;
     font-size: 13px;
     padding: 12px;
     text-align: center;
@@ -255,9 +259,13 @@
 /* ============ 写作画像（字数 + 消息统计） ============ */
 .tf-writing {
     grid-column: 1 / -1;
+    /* v2.9.9：底色改走扩展自己的主题变量（与上方 .tf-stat-card 同一套做法），
+       不再用宿主的 --SmartThemeBlurTintColor。否则「深色扩展主题 + 浅色宿主」时
+       卡片是浅色、卡内文字却是扩展主题的浅色 —— 整块文字都对不上（11px 的
+       副标题最明显）。主题块（下方 [data-tf-theme] .tf-writing）只加边框/阴影。 */
     background: linear-gradient(135deg,
-        color-mix(in srgb, var(--SmartThemeBlurTintColor, #1e293b) 82%, transparent),
-        color-mix(in srgb, #312e81 18%, var(--SmartThemeBlurTintColor, #0f172a) 60%));
+        var(--tf-surface-2, rgba(128, 128, 128, 0.10)),
+        var(--tf-surface, rgba(128, 128, 128, 0.18)));
     border: 1px solid var(--tf-border, var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.28)));
     border-radius: 16px;
     padding: 16px 18px;
@@ -390,11 +398,7 @@
     /* v2.7.0：去掉无限 box-shadow 动画（每帧重绘，平板纯耗电） */
 }
 
-/* 呼吸式主题光晕 */
-@keyframes tfOrbFloat {
-    0%, 100% { box-shadow: 0 0 18px color-mix(in srgb, var(--tf-accent, #5eead4) 45%, transparent), inset 0 1px 1px rgba(255,255,255,.25), 0 14px 30px rgba(0,0,0,.4); }
-    50%      { box-shadow: 0 0 30px color-mix(in srgb, var(--tf-accent, #5eead4) 70%, transparent), inset 0 1px 1px rgba(255,255,255,.3), 0 18px 38px rgba(0,0,0,.46); }
-}
+/* v2.9.9：删掉从未被引用的 @keyframes tfOrbFloat（v2.7.0 起就不用了） */
 
 .tf-orb:hover {
     transform: translateY(-3px) scale(1.06);
@@ -419,9 +423,8 @@
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--tf-accent, #5eead4) 45%, transparent), 0 0 34px color-mix(in srgb, var(--tf-accent, #5eead4) 75%, transparent), 0 18px 45px rgba(0, 0, 0, 0.45);
 }
 
-.tf-orb.draw-hint {
-    animation: tf-hint-rotate .9s ease-in-out forwards;
-}
+/* v2.9.9：删掉 .tf-orb.draw-hint —— 它引用的 @keyframes tf-hint-rotate 从来不存在，
+   而且 JS 里也没有任何地方加过 draw-hint 这个类（双重失效的死规则） */
 
 .tf-orb-icon {
     font-size: 22px;
@@ -593,10 +596,12 @@
 .tf-budget-fill {
     height: 100%;
     border-radius: 999px;
-    background: linear-gradient(90deg, #5eead4, #93c5fd);
+    /* v2.9.9：接上各主题早已定义的 --tf-grad-main（此前写死青色，五套主题共用一条渐变） */
+    background: var(--tf-grad-main, linear-gradient(90deg, #5eead4, #93c5fd));
     transition: width 0.4s ease;
 }
 .tf-budget-fill.warn {
+    /* 预警/超支保持语义色，不跟主题走 */
     background: linear-gradient(90deg, #fcd34d, #f59e0b);
 }
 .tf-budget-fill.over {
@@ -619,44 +624,9 @@
  * ============================================================ */
 
 /* --- 主题切换器 --- */
-.tf-theme-picker {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    align-items: center;
-}
-.tf-theme-chip {
-    appearance: none;
-    -webkit-appearance: none;
-    border: 1px solid var(--tf-border, var(--SmartThemeBorderColor, rgba(128,128,128,0.3)));
-    background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 60%, transparent);
-    color: var(--tf-text, var(--SmartThemeBodyColor, #ccc));
-    border-radius: 999px;
-    padding: 5px 12px;
-    font-size: 12px;
-    cursor: pointer;
-    transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
-    opacity: 0.8;
-}
-.tf-theme-chip:hover {
-    transform: translateY(-1px);
-    opacity: 1;
-}
-.tf-theme-chip.active {
-    border-color: var(--tf-accent, #5eead4);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--tf-accent, #5eead4) 35%, transparent);
-    color: var(--tf-accent, #5eead4);
-    opacity: 1;
-}
-.tf-theme-chip .tf-theme-dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    margin-right: 5px;
-    vertical-align: middle;
-    box-shadow: 0 0 6px color-mix(in srgb, currentColor 60%, transparent);
-}
+/* v2.9.9：删掉 .tf-theme-picker / .tf-theme-chip / .tf-theme-dot 三组规则 ——
+   现在面板用的是 .tf-theme-switcher + .tf-theme-menu-item（见下方），
+   改样式前它们就已经没有 DOM 来源，这一轮又删掉了最后那个恒为空的查询。 */
 
 /* ============ 主题 1 · 「赛博帝京」 Cyber Imperial ============
  *  高饱和霓虹电光 × 帝都红金重彩，硬核赛博朋克帝王气场 */
@@ -664,10 +634,7 @@
     --tf-accent: #ff2d95;
     --tf-accent2: #00e5ff;
     --tf-grad-main: linear-gradient(90deg, #ff2d95, #ffb300, #00e5ff);
-    --tf-grad-cost: linear-gradient(90deg, #00e5ff, #ff2d95);
-    --tf-glow: rgba(255, 45, 149, 0.55);
     --tf-text: #eef2ff;
-    --tf-text-muted: #bdb9e0;
     --tf-surface: rgba(24, 12, 44, 0.55);
     --tf-surface-2: rgba(255, 255, 255, 0.07);
     --tf-border: rgba(255, 255, 255, 0.18);
@@ -696,10 +663,7 @@
     --tf-accent: #8aa8b8;
     --tf-accent2: #4a6b7a;
     --tf-grad-main: linear-gradient(90deg, #f5f0e8, #b8c6cc, #8aa8b8);
-    --tf-grad-cost: linear-gradient(90deg, #8aa8b8, #4a6b7a);
-    --tf-glow: rgba(138, 168, 184, 0.45);
     --tf-text: #e9eff2;
-    --tf-text-muted: #a9bcc4;
     --tf-surface: rgba(28, 38, 44, 0.72);
     --tf-surface-2: rgba(255, 255, 255, 0.06);
     --tf-border: rgba(255, 255, 255, 0.16);
@@ -724,10 +688,7 @@
     --tf-accent: #7df9ff;
     --tf-accent2: #b388ff;
     --tf-grad-main: linear-gradient(90deg, #7df9ff, #66d9ff, #b388ff);
-    --tf-grad-cost: linear-gradient(90deg, #ff6ec7, #7df9ff);
-    --tf-glow: rgba(125, 249, 255, 0.5);
     --tf-text: #eaf6ff;
-    --tf-text-muted: #a9b8d8;
     --tf-surface: rgba(12, 18, 44, 0.58);
     --tf-surface-2: rgba(255, 255, 255, 0.07);
     --tf-border: rgba(255, 255, 255, 0.18);
@@ -756,10 +717,7 @@
     --tf-accent: #ffb347;
     --tf-accent2: #ff6a3d;
     --tf-grad-main: linear-gradient(90deg, #ffe29a, #ffb347, #ff6a3d);
-    --tf-grad-cost: linear-gradient(90deg, #ff6a3d, #ffd34d);
-    --tf-glow: rgba(255, 179, 71, 0.5);
     --tf-text: #fff3e2;
-    --tf-text-muted: #d8b892;
     --tf-surface: rgba(46, 24, 4, 0.6);
     --tf-surface-2: rgba(255, 255, 255, 0.07);
     --tf-border: rgba(255, 255, 255, 0.18);
@@ -787,11 +745,8 @@
 [data-tf-theme="mono-white"] {
     --tf-accent: #64748b;
     --tf-accent2: #94a3b8;
-    --tf-grad-main: linear-gradient(90deg, #e2e8f0, #cbd5e1, #94a3b8);
-    --tf-grad-cost: linear-gradient(90deg, #cbd5e1, #64748b);
-    --tf-glow: rgba(148, 163, 184, 0.4);
+    --tf-grad-main: linear-gradient(90deg, #64748b, #334155);
     --tf-text: #1e293b;
-    --tf-text-muted: #52627a;
     --tf-surface: #f8fafc;
     --tf-surface-2: rgba(100, 116, 139, 0.09);
     --tf-border: rgba(100, 116, 139, 0.32);
@@ -849,7 +804,9 @@
 }
 .tf-quota-sub {
     font-size: 11px;
-    opacity: 0.6;
+    /* v2.9.9：同 .tf-dash-muted —— 用更高的不透明度（.8，11px 小字浅色底 7.2:1），
+       不换成主题实色（配额卡的底色来自宿主，实色会在浅色宿主下反向变差） */
+    opacity: 0.8;
     letter-spacing: 0.01em;
 }
 
@@ -1064,6 +1021,8 @@
     cursor: pointer;
     font-size: 14px;
     padding: 6px 9px;
+    /* v2.9.9：触控目标 ≥44px（面板头部这排图标按钮原来只有 ~27px） */
+    min-height: 44px;
     border-radius: 8px;
     background: color-mix(in srgb, var(--tf-accent, #5eead4) 12%, transparent);
     color: var(--tf-accent, #5eead4);
@@ -1122,6 +1081,8 @@
     font-size: 13px;
     padding: 6px 9px;
     min-width: 30px;
+    /* v2.9.9：触控目标 ≥44px（与 .tf-tab-btn / .tf-check 保持一致） */
+    min-height: 44px;
     border-radius: 8px;
     border: 1px solid var(--tf-border, var(--SmartThemeBorderColor, rgba(128,128,128,.3)));
     background: transparent;
@@ -1375,6 +1336,11 @@
     padding: 4px 12px;
     font-size: 12px;
     line-height: 1.4;
+    /* v2.9.9：触控目标 ≥44px（原来约 27px，手机上容易点错） */
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     cursor: pointer;
     transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
 }
@@ -1834,34 +1800,12 @@
     justify-content: flex-end;
 }
 
-/* 窄屏：改成从底部升起的面板。
-   bottom:0 + top:auto + transform:none 是"结构上的保证"——
-   高度被 max-height 限住，表头就永远在屏幕内，不会再被顶出去。 */
-@media (max-width: 560px) {
-    .tf-panel {
-        top: auto;
-        bottom: 0;
-        left: 0;
-        right: 0;
-        transform: none;
-        width: 100%;
-        max-width: 100%;
-        border-radius: 16px 16px 0 0;
-        max-height: 84vh;
-        max-height: min(84vh, 640px);
-        max-height: min(84dvh, 640px);
-    }
-    .tf-panel-title span { display: none; }
-    .tf-panel-actions .menu_button,
-    .tf-theme-switch-btn {
-        min-width: 30px;
-        padding: 5px 6px;
-        font-size: 13px;
-    }
-    .tf-panel-body {
-        padding: 14px 12px calc(14px + env(safe-area-inset-bottom, 0px));
-    }
-}
+/* v2.9.9：删掉旧的「窄屏从底部升起」媒体块 —— 它的定位属性被后面同优先级的
+   另一块（@media max-width:560px）全额覆盖，max-height 被更靠后的普通规则
+   .tf-panel{max-height:88vh} 覆盖，所以这一整块从来没生效过。
+   注意：它里面那句 env(safe-area-inset-bottom) 也因此从未生效 —— 下面幸存块里的
+   那句是本轮**新增**的（不是「补回」），有刘海/手势条的机型底部会多留一点安全区。
+   真正的定位由 JS 负责，见下方 v2.8.0 注释。 */
 
 /* ============================================================
  *  v2.8.0 · 浮层定位改由 JS 负责，CSS 不再参与定位
@@ -1906,7 +1850,8 @@
         font-size: 13px;
     }
     .tf-panel-body {
-        padding: 14px 12px;
+        /* v2.9.9：补回被删掉的旧块里那句安全区内边距 —— 底部内容不要压在手势条下面 */
+        padding: 14px 12px calc(14px + env(safe-area-inset-bottom, 0px));
     }
 }
 
@@ -2300,5 +2245,21 @@
     cursor: pointer;
     padding: 2px 0;
     font-weight: 600;
-    min-height: 36px;
+    /* v2.9.9：触控目标 ≥44px（原 36px 低于本项目自己的标准） */
+    min-height: 44px;
+}
+
+/* ---------- v2.9.9 补上 JS 里用到、之前没有规则的类 ---------- */
+/* 自定义范围条左边的 📅 图标（JS tf-range-bar-icon）—— 父级 .tf-range-bar 是 flex + gap，
+   所以这里不要再加 margin，否则间距会变成 gap+margin 双份 */
+.tf-range-bar-icon {
+    flex: 0 0 auto;
+    font-size: 14px;
+    line-height: 1;
+}
+/* 渠道编辑表单里的口径行容器（JS tf-channel-sources） */
+.tf-channel-sources {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
 }

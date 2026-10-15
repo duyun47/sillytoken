@@ -249,6 +249,7 @@
   "多个候选（建议设别名）": "Multiple candidates (set alias)",
   "未知（旧记录）": "Unknown (old records)",
   "未归类": "Uncategorized",
+  "其他口径（超出上限）": "Other sources (over cap)",
   "按渠道": "By Channel",
   "归入渠道": "Assign to channel",
   "已按天归组": "Assigned by day",
@@ -297,5 +298,5 @@
   "角色": "Chars",
   "角色字数": "Char words",
   "费用暂记 0": "cost temporarily 0",
-  "还没开启悬浮球 —— 已为你创建，现在可以打开了": "Floating orb wasn't enabled — created it for you, try again now"
+  "打不开统计面板 —— 请刷新页面重试": "Cannot open the stats panel — please refresh the page and retry"
 }
