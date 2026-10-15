@@ -2246,3 +2246,43 @@
     border-radius: 10px;
     background: var(--tf-surface-2, rgba(128, 128, 128, 0.05));
 }
+
+/* ---------- v2.9.2 口径速配（见过的网站/口径 → 归渠道） ---------- */
+.tf-seen {
+    border: 1px solid var(--tf-border, var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3)));
+    border-radius: 12px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.tf-seen-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    min-height: 40px;
+}
+
+.tf-seen-key {
+    flex: 1 1 130px;
+    min-width: 110px;
+    font-size: 13px;
+    word-break: break-all;
+}
+
+.tf-seen-meta {
+    flex: 0 0 auto;
+    font-size: 11px;
+    opacity: 0.65;
+    white-space: nowrap;
+}
+
+.tf-seen-row .tf-source-sel {
+    flex: 0 1 150px;
+}
+
+.tf-seen-row .tf-origin-inp {
+    flex: 1 1 120px;
+}

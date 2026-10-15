@@ -260,5 +260,11 @@
   "还没有渠道 —— 先到「管理 → 渠道」建一个（系统预填的官方渠道已自动就位）": "No channels yet — create one in Manage → Channels (presets are auto-placed)",
   "还没有可用渠道": "No channel available yet",
   "可选：只归指定开头的模型（按归一化匹配，假流式- 这类装饰不影响），如 gemini": "Optional: only models starting with (matched after name normalization, decorations like 假流式- don't matter), e.g. gemini",
-  "反代": "Proxy"
+  "反代": "Proxy",
+  "还没有记录到任何口径 —— 跑一次真请求后，这里会列出你用过的网站": "No sources recorded yet — run one real request and they'll show up here",
+  "见过的口径 —— 下拉归入渠道": "Seen sources — pick a channel in the dropdown",
+  "新渠道…": "New channel…",
+  "新渠道名，如：API易自费": "New channel name, e.g. API易自费",
+  "归入": "Assign",
+  "—— 已归组的 ——": "— assigned —"
 }

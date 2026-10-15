@@ -3994,6 +3994,12 @@ function renderChannelsSub(container, s) {
     intro.textContent = safeT('渠道 = 这笔消费从哪个口子走。官方渠道按酒馆选的 API 类型自动归；转口选「自定义」填地址。改完立即影响分组（含历史）');
     container.appendChild(intro);
 
+    // ---- v2.9.2 口径速配：把记账时见过的网站/口径列出来，没归组的置顶 ----
+    // 用户口述诉求：「你需要给我一个添加网站的地方」「有时候可能需要多个网站」——
+    // 地址支持本来就靠渠道口径行的「＋再加一口径」（多行=多站同归）；
+    // 这里补的是「不用手抄域名」：见过的口径直接下拉归渠道。
+    renderSeenSources(container, s);
+
     const list = document.createElement('div');
     list.className = 'tf-channel-list';
     s.channels.forEach((c, i) => {
@@ -4104,7 +4110,7 @@ function renderChannelsSub(container, s) {
                 sourcesBox.appendChild(rowEl);
             });
         };
-        if (!cur.length) cur.push('makersuite');
+        if (!cur.length) cur.push('custom');   // 默认先加「按地址」，这是最常见的转口接法
         renderSourceRows();
         form.appendChild(sourcesBox);
 
@@ -4918,6 +4924,131 @@ function tfRenderChart(container, s, stats) {
 }
 
 let tfPatchDraftOpen = false;
+
+/** 汇总四层记账里见过的所有口径（key → 请求次数/token），供「口径速配」展示 */
+function tfCollectSeenSourceKeys(s) {
+    const seen = new Map();
+    const sources = [s?.stats?.models, s?.session?.models, s?.dailyStats?.models];
+    if (Array.isArray(s?.history)) for (const rec of s.history) if (rec && rec.models) sources.push(rec.models);
+    for (const models of sources) {
+        for (const m of Object.values(models || {})) {
+            if (!m || typeof m.sources !== 'object' || !m.sources) continue;
+            for (const [sk, sv] of Object.entries(m.sources)) {
+                if (!sk || typeof sv !== 'object' || !sv) continue;
+                const agg = seen.get(sk) || { req: 0, tokens: 0 };
+                agg.req += sv.req || 0;
+                agg.tokens += (sv.in || 0) + (sv.out || 0) + (sv.cached || 0);
+                seen.set(sk, agg);
+            }
+        }
+    }
+    // 带地址的口径（网站/反代）排前面，纯类型靠后；各按请求次数排序
+    return [...seen.entries()]
+        .map(([key, agg]) => ({ key, req: agg.req, tokens: agg.tokens }))
+        .sort((a, b) => {
+            const wa = (a.key.startsWith('custom:') || a.key.startsWith('proxy:')) ? 0 : 1;
+            const wb = (b.key.startsWith('custom:') || b.key.startsWith('proxy:')) ? 0 : 1;
+            return wa - wb || b.req - a.req;
+        });
+}
+
+/** v2.9.2 口径速配区：见过的口径 + 下拉归渠道，没归组的排前面 */
+function renderSeenSources(container, s) {
+    const seen = tfCollectSeenSourceKeys(s);
+    if (!seen.length) {
+        const hint = document.createElement('div');
+        hint.className = 'tf-writing-hint';
+        hint.textContent = safeT('还没有记录到任何口径 —— 跑一次真请求后，这里会列出你用过的网站');
+        container.appendChild(hint);
+        return;
+    }
+    const rules = tfChannelRules(s);
+    const assigned = new Set(Object.keys(rules));
+    const unassigned = seen.filter((x) => !assigned.has(x.key));
+    const assignedList = seen.filter((x) => assigned.has(x.key));
+
+    const box = document.createElement('div');
+    box.className = 'tf-seen';
+    const head = document.createElement('div');
+    head.className = 'tf-pending-head';
+    head.textContent = safeT('见过的口径 —— 下拉归入渠道');
+    box.appendChild(head);
+
+    const makeRow = (item, isUnassigned) => {
+        const row = document.createElement('div');
+        row.className = 'tf-seen-row';
+        const label = document.createElement('span');
+        label.className = 'tf-seen-key';
+        label.textContent = tfSourceLabel(item.key);
+        row.appendChild(label);
+        const meta = document.createElement('span');
+        meta.className = 'tf-seen-meta';
+        meta.textContent = item.req + safeT('次') + ' · ' + fmtTokens(item.tokens);
+        row.appendChild(meta);
+
+        if (!isUnassigned) {
+            const on = document.createElement('span');
+            on.className = 'tf-card-badge';
+            on.textContent = '→ ' + rules[item.key];
+            row.appendChild(on);
+            box.appendChild(row);
+            return;
+        }
+
+        const sel = document.createElement('select');
+        sel.className = 'text_pole tf-source-sel';
+        const optNew = document.createElement('option');
+        optNew.value = '__new__';
+        optNew.textContent = '＋ ' + safeT('新渠道…');
+        sel.appendChild(optNew);
+        for (const c of (s.channels || [])) {
+            const o = document.createElement('option');
+            o.value = c.name;
+            o.textContent = c.name;
+            sel.appendChild(o);
+        }
+        row.appendChild(sel);
+
+        const nameInp = document.createElement('input');
+        nameInp.type = 'text';
+        nameInp.className = 'text_pole tf-origin-inp';
+        nameInp.placeholder = safeT('新渠道名，如：API易自费');
+        nameInp.style.display = 'none';
+        row.appendChild(nameInp);
+        sel.addEventListener('change', () => { nameInp.style.display = sel.value === '__new__' ? '' : 'none'; });
+
+        const save = tfButton(safeT('归入'), () => {
+            const key = item.key;
+            if (sel.value === '__new__') {
+                const name = nameInp.value.trim();
+                if (!name) { tfNotify(safeT('渠道名不能为空')); return; }
+                if ((s.channels || []).some((c) => c.name === name)) { tfNotify(safeT('已有同名渠道')); return; }
+                s.channels.push({ name, sources: [key] });
+            } else {
+                const c = (s.channels || []).find((x) => x.name === sel.value);
+                if (!c) return;
+                if (!Array.isArray(c.sources)) c.sources = [];
+                if (!c.sources.includes(key)) c.sources.push(key);
+            }
+            saveSettingsDebounced();
+            safeUpdateUI();
+        }, 'tf-diag-btn');
+        row.appendChild(save);
+        box.appendChild(row);
+    };
+
+    for (const item of unassigned) makeRow(item, true);
+    if (unassigned.length && assignedList.length) {
+        const sep = document.createElement('div');
+        sep.className = 'tf-writing-hint';
+        sep.textContent = safeT('—— 已归组的 ——');
+        box.appendChild(sep);
+    }
+    for (const item of assignedList) makeRow(item, false);
+
+    container.appendChild(box);
+}
+
 
 /** v2.9.0 天级补丁栏：把某天（不真实的来源数据）整体归入某个渠道 */
 function renderDayPatchBar(box, s, date) {
