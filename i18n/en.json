@@ -266,5 +266,9 @@
   "新渠道…": "New channel…",
   "新渠道名，如：API易自费": "New channel name, e.g. API易自费",
   "归入": "Assign",
-  "—— 已归组的 ——": "— assigned —"
+  "—— 已归组的 ——": "— assigned —",
+  "（整天）": "(whole day)",
+  "撤销这一条归组": "Undo this assignment",
+  "（仅 ": "(only ",
+  " 开头）": "-prefixed)"
 }

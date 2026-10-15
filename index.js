@@ -3361,7 +3361,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.9.3';
+const TF_VERSION = '2.9.4';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
@@ -4491,9 +4491,15 @@ function tfAggregateRange(s, range) {
     // v2.9.0 渠道聚合：source 有分桶的记录按口径归类；
     // 没来源的老记录先看「天级补丁」（数据层见 s.dayPatches），没有补丁归「未知」
     const byChannel = new Map();
+    // v2.9.4：一天可以有多条补丁（gemini→甲、doubao→乙、再加一条无前缀兜底）。
+    // 旧实现 set(date, patch) 会让同天后存的覆盖先存的 —— 改成按日期挂数组。
     const patchesByDate = new Map();
     for (const p of (s.dayPatches || [])) {
-        if (p && p.date && p.channel) patchesByDate.set(String(p.date), p);
+        if (p && p.date && p.channel) {
+            const list = patchesByDate.get(String(p.date)) || [];
+            list.push(p);
+            patchesByDate.set(String(p.date), list);
+        }
     }
     const summary = { ...tfNewBucket(), legacyDays: 0, legacyTokens: 0, legacyCost: 0 };
 
@@ -4534,41 +4540,42 @@ function tfAggregateRange(s, range) {
             for (const k of keys) pushChannel(tfChannelOfSource(s, k) || safeT('未归类'), entry.sources[k]);
             return;
         }
-        // v2.9.3：这里原来在「有没有补丁」的判断**外面**读取 patch.pattern ——
-        // 一个真机热修复：没有补丁的日常记录聚到这里，直接在 undefined 上读
-        // pattern 抛异常，整块统计聚合失败（真机表现为「统计不渲染」）。
-        // 现在全部读写都收进 patch 存在的分支。
-        const patch = dayDate ? patchesByDate.get(String(dayDate)) : null;
-        if (!patch) {
+        // v2.9.3 修复过的分支（v2.9.4 升级为多条补丁）：
+        // 无补丁 → 「未知」；多条补丁按「前缀条优先、无前缀兜底、先定义先匹配」。
+        // 前缀按归一化名字比对（剥 假流式-/FB[NV]/vendor/-preview 等装饰），原始名前缀兜底。
+        const list = dayDate ? patchesByDate.get(String(dayDate)) : null;
+        if (!list || !list.length) {
             pushChannel(safeT('未知（旧记录）'), entry);
-            return;
-        }
-        // v2.9.1 起按「归一化后的模型名」匹配补丁前缀：
-        // 酒馆发上来的名字常带装饰（假流式- / [NV] / vendor/ / -preview 等），
-        // 归一化剥掉装饰后比对，旧的原始名前缀匹配保留为兜底，任一命中即归组。
-        const pat = String(patch.pattern || '').trim().toLowerCase();
-        if (!pat) {
-            pushChannel(patch.channel, entry);
             return;
         }
         const canon = tfCanonicalModel(String(name || ''));
-        const patCanon = tfCanonicalModel(pat);
-        if (canon.startsWith(patCanon) || String(name || '').toLowerCase().startsWith(pat)) {
-            pushChannel(patch.channel, entry);
-        } else {
-            pushChannel(safeT('未知（旧记录）'), entry);
+        const rawLow = String(name || '').toLowerCase();
+        const ordered = list.filter((p) => p.pattern).concat(list.filter((p) => !p.pattern));
+        for (const patch of ordered) {
+            const pat = String(patch.pattern || '').trim().toLowerCase();
+            if (!pat) { pushChannel(patch.channel, entry); return; }   // 兜底：剩下的全归它
+            const patCanon = tfCanonicalModel(pat);
+            if (canon.startsWith(patCanon) || rawLow.startsWith(pat)) { pushChannel(patch.channel, entry); return; }
         }
+        pushChannel(safeT('未知（旧记录）'), entry);
     };
 
     if (range && range.mode === 'preset' && range.id === 'all') {
-        for (const [name, entry] of Object.entries(s.stats.models || {})) {
-            addModel(name, entry);
-            // 「全部」口径用 lifetime 桶，没有日期上下文，天级补丁不参与：
-            // 有 sources 的按渠道归，没有的归「未知（旧记录）」
-            accChannels(name, entry, null);
-        }
+        // 合计 / 按模型 / 按厂商 维持 lifetime 原样（包含超过保留天数的部分）
+        for (const [name, entry] of Object.entries(s.stats.models || {})) addModel(name, entry);
         for (const rec of (s.history || [])) {
             if (rec && rec.date) dayMap.set(rec.date, rec);
+        }
+        // v2.9.4：「全部」的渠道聚合改走「逐日」路径 —— 有日期，天级补丁才能生效
+        // （旧实现在 lifetime 桶上归渠道，没有日期上下文，补丁全部失效，
+        //   用户把「按天归组」补满也看不到 —— 真机反馈）。
+        const live = tfTodayStats(s);
+        if (live && live.date) {
+            dayMap.set(live.date, { date: live.date, cost: live.cost || 0, tokens: live.tokens || 0, req: live.req || 0, models: live.models || {} });
+        }
+        for (const rec of dayMap.values()) {
+            const models = rec && rec.models && Object.keys(rec.models).length ? rec.models : null;
+            if (models) for (const [name, entry] of Object.entries(models)) accChannels(name, entry, rec.date);
         }
     } else {
         const inRange = (date) => date >= fromKey && date <= toKey;
@@ -5057,29 +5064,40 @@ function renderSeenSources(container, s) {
 /** v2.9.0 天级补丁栏：把某天（不真实的来源数据）整体归入某个渠道 */
 function renderDayPatchBar(box, s, date) {
     if (!Array.isArray(s.dayPatches)) s.dayPatches = [];
-    const existing = s.dayPatches.find((p) => p && p.date === date);
+    // v2.9.4：一天可能有多条补丁（不同前缀各归各），全部逐条显示，
+    // 每条自带撤销——旧版只 find 第一条，其余的存了也看不见。
+    const list = s.dayPatches.filter((p) => p && p.date === date);
     const bar = document.createElement('div');
     bar.className = 'tf-day-patch-bar';
-    const tag = document.createElement('span');
-    tag.className = 'tf-day-patch-tag' + (existing ? ' set' : '');
-    tag.textContent = existing
-        ? safeT('已按天归组') + '：' + existing.channel + (existing.pattern ? '（仅 ' + existing.pattern + ' 开头）' : '')
-        : safeT('这天是老记录？可整体归入某个渠道');
-    bar.appendChild(tag);
-
+    if (!list.length) {
+        const tag = document.createElement('span');
+        tag.className = 'tf-day-patch-tag';
+        tag.textContent = safeT('这天是老记录？可整体归入某个渠道');
+        bar.appendChild(tag);
+    }
+    for (const p of list) {
+        const tag = document.createElement('span');
+        tag.className = 'tf-day-patch-tag set';
+        tag.textContent = (p.pattern ? safeT('已按天归组') + '：' + p.channel + safeT('（仅 ') + p.pattern + safeT(' 开头）')
+                                        : safeT('已按天归组') + '：' + p.channel + safeT('（整天）'));
+        bar.appendChild(tag);
+        const undo = document.createElement('button');
+        undo.type = 'button';
+        undo.className = 'tf-del';
+        undo.textContent = '✕';
+        undo.title = safeT('撤销这一条归组');
+        undo.addEventListener('click', () => {
+            const idx = s.dayPatches.indexOf(p);
+            if (idx >= 0) s.dayPatches.splice(idx, 1);
+            saveSettingsDebounced();
+            safeUpdateUI();
+        });
+        bar.appendChild(undo);
+    }
     bar.appendChild(tfButton(safeT('归入渠道'), () => {
         tfPatchDraftOpen = !tfPatchDraftOpen;
         safeUpdateUI();
     }, 'tf-diag-btn'));
-
-    if (existing) {
-        bar.appendChild(tfButton(safeT('撤销'), () => {
-            const idx = s.dayPatches.indexOf(existing);
-            if (idx >= 0) s.dayPatches.splice(idx, 1);
-            saveSettingsDebounced();
-            safeUpdateUI();
-        }, 'tf-diag-btn'));
-    }
     box.appendChild(bar);
 
     if (tfPatchDraftOpen) {
@@ -5100,13 +5118,16 @@ function renderDayPatchBar(box, s, date) {
             o.textContent = n;
             sel.appendChild(o);
         }
-        if (existing) sel.value = existing.channel;
+        if (list.length) sel.value = list[0].channel;
+        // v2.9.4：注意新语义 —— 这天的「哪条渠道」只是表单默认值；
+        // 保存的是一条新补丁（同天同前缀 = 覆盖那一条，其它条保留），
+        // 多条前缀可以共存（gemini→甲、doubao→乙、无前缀=剩余归丙）。
         form.appendChild(sel);
 
         const patInp = document.createElement('input');
         patInp.className = 'text_pole tf-origin-inp';
         patInp.placeholder = safeT('可选：只归指定开头的模型（按归一化匹配，假流式- 这类装饰不影响），如 gemini');
-        patInp.value = existing ? (existing.pattern || '') : '';
+        patInp.value = list.length ? (list[0].pattern || '') : '';
         form.appendChild(patInp);
 
         const note = document.createElement('div');
