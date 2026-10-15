@@ -3361,7 +3361,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.9.4';
+const TF_VERSION = '2.9.5';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
@@ -4000,6 +4000,9 @@ function renderChannelsSub(container, s) {
     // 这里补的是「不用手抄域名」：见过的口径直接下拉归渠道。
     renderSeenSources(container, s);
 
+    // ---- v2.9.5 归组补丁清单：单日/区间补丁汇总，逐条撤销 ----
+    renderPatchList(container, s);
+
     const list = document.createElement('div');
     list.className = 'tf-channel-list';
     s.channels.forEach((c, i) => {
@@ -4492,15 +4495,31 @@ function tfAggregateRange(s, range) {
     // 没来源的老记录先看「天级补丁」（数据层见 s.dayPatches），没有补丁归「未知」
     const byChannel = new Map();
     // v2.9.4：一天可以有多条补丁（gemini→甲、doubao→乙、再加一条无前缀兜底）。
-    // 旧实现 set(date, patch) 会让同天后存的覆盖先存的 —— 改成按日期挂数组。
-    const patchesByDate = new Map();
+    // v2.9.5：补丁支持区间形态 {from, to, pattern, channel}（to 空 = 从起日起到最新），
+    // 与单日形态 {date, ...} 混用；匹配顺序统一见 accChannels。
+    const DAY_ALL = '0000-00-00';
+    const DAY_MAX = '9999-99-99';
+    const patchListAll = [];
     for (const p of (s.dayPatches || [])) {
-        if (p && p.date && p.channel) {
-            const list = patchesByDate.get(String(p.date)) || [];
-            list.push(p);
-            patchesByDate.set(String(p.date), list);
+        if (p && p.channel && (p.date || p.from || p.to !== undefined)) {
+            if (p.date) patchListAll.push(p);
+            else patchListAll.push({
+                from: p.from ? String(p.from) : DAY_ALL,
+                to: p.to ? String(p.to) : DAY_MAX,
+                pattern: p.pattern || '',
+                channel: p.channel,
+                range: true,
+            });
         }
     }
+    const patchesForDay = (dayDate) => {
+        if (!dayDate) return [];
+        const out = [];
+        for (const p of patchListAll) {
+            if (p.date ? String(p.date) === String(dayDate) : (String(dayDate) >= p.from && String(dayDate) <= p.to)) out.push(p);
+        }
+        return out;
+    };
     const summary = { ...tfNewBucket(), legacyDays: 0, legacyTokens: 0, legacyCost: 0 };
 
     const addModel = (name, entry) => {
@@ -4540,10 +4559,10 @@ function tfAggregateRange(s, range) {
             for (const k of keys) pushChannel(tfChannelOfSource(s, k) || safeT('未归类'), entry.sources[k]);
             return;
         }
-        // v2.9.3 修复过的分支（v2.9.4 升级为多条补丁）：
+        // v2.9.3 修复过的分支（v2.9.4 升级为多条补丁，v2.9.5 支持区间）：
         // 无补丁 → 「未知」；多条补丁按「前缀条优先、无前缀兜底、先定义先匹配」。
         // 前缀按归一化名字比对（剥 假流式-/FB[NV]/vendor/-preview 等装饰），原始名前缀兜底。
-        const list = dayDate ? patchesByDate.get(String(dayDate)) : null;
+        const list = patchesForDay(dayDate);
         if (!list || !list.length) {
             pushChannel(safeT('未知（旧记录）'), entry);
             return;
@@ -4936,8 +4955,7 @@ function tfRenderChart(container, s, stats) {
 
 let tfPatchDraftOpen = false;
 
-/** 汇总四层记账里见过的所有口径（key → 请求次数/token），供「口径速配」展示 */
-function tfCollectSeenSourceKeys(s) {
+/** 汇总四层记账里见过的所有口径（key → 请求次数/token），供「口径速配」展示 */function tfCollectSeenSourceKeys(s) {
     const seen = new Map();
     const sources = [s?.stats?.models, s?.session?.models, s?.dailyStats?.models];
     if (Array.isArray(s?.history)) for (const rec of s.history) if (rec && rec.models) sources.push(rec.models);
@@ -4961,6 +4979,43 @@ function tfCollectSeenSourceKeys(s) {
             const wb = (b.key.startsWith('custom:') || b.key.startsWith('proxy:')) ? 0 : 1;
             return wa - wb || b.req - a.req;
         });
+}
+
+/** v2.9.5 归组补丁清单：单日/区间补丁汇总展示，逐条撤销 */
+function renderPatchList(container, s) {
+    const list = (s.dayPatches || []).filter((p) => p && p.channel && (p.date || p.from || (p.to !== undefined && p.to !== null)));
+    if (!list.length) return;
+    const box = document.createElement('div');
+    box.className = 'tf-seen';
+    const head = document.createElement('div');
+    head.className = 'tf-pending-head';
+    head.textContent = safeT('已有的归组补丁（单日/区间）') + '（' + list.length + '）';
+    box.appendChild(head);
+    for (const p of list) {
+        const row = document.createElement('div');
+        row.className = 'tf-seen-row';
+        const label = document.createElement('span');
+        label.className = 'tf-seen-key';
+        const kind = p.pattern ? safeT('（仅 ') + p.pattern + safeT(' 开头）') : safeT('（整天）');
+        label.textContent = p.date
+            ? safeT('单日') + ' [' + p.date + '] ' + p.channel + kind
+            : safeT('区间') + ' [' + (p.from || '') + ' ~ ' + (p.to || safeT('以后')) + '] ' + p.channel + kind;
+        row.appendChild(label);
+        const undo = document.createElement('button');
+        undo.type = 'button';
+        undo.className = 'tf-del';
+        undo.textContent = '✕';
+        undo.title = safeT('撤销这一条归组');
+        undo.addEventListener('click', () => {
+            const idx = s.dayPatches.indexOf(p);
+            if (idx >= 0) s.dayPatches.splice(idx, 1);
+            saveSettingsDebounced();
+            safeUpdateUI();
+        });
+        row.appendChild(undo);
+        box.appendChild(row);
+    }
+    container.appendChild(box);
 }
 
 /** v2.9.2 口径速配区：见过的口径 + 下拉归渠道，没归组的排前面 */
@@ -5066,7 +5121,14 @@ function renderDayPatchBar(box, s, date) {
     if (!Array.isArray(s.dayPatches)) s.dayPatches = [];
     // v2.9.4：一天可能有多条补丁（不同前缀各归各），全部逐条显示，
     // 每条自带撤销——旧版只 find 第一条，其余的存了也看不见。
-    const list = s.dayPatches.filter((p) => p && p.date === date);
+    // v2.9.5：命中这一天的补丁 = 单日补丁(date 等于当天) + 覆盖到当天的区间补丁
+    const list = (s.dayPatches || []).filter((p) => {
+        if (!p || !p.channel) return false;
+        if (p.date) return String(p.date) === String(date);
+        const from = p.from ? String(p.from) : '0000-00-00';
+        const to = p.to ? String(p.to) : '9999-99-99';
+        return String(date) >= from && String(date) <= to;
+    });
     const bar = document.createElement('div');
     bar.className = 'tf-day-patch-bar';
     if (!list.length) {
@@ -5078,8 +5140,11 @@ function renderDayPatchBar(box, s, date) {
     for (const p of list) {
         const tag = document.createElement('span');
         tag.className = 'tf-day-patch-tag set';
-        tag.textContent = (p.pattern ? safeT('已按天归组') + '：' + p.channel + safeT('（仅 ') + p.pattern + safeT(' 开头）')
-                                        : safeT('已按天归组') + '：' + p.channel + safeT('（整天）'));
+        const kind = (p.pattern ? safeT('（仅 ') + p.pattern + safeT(' 开头）') : safeT('（整天）'));
+        tag.textContent = p.date
+            ? safeT('已按天归组') + '：' + p.channel + kind
+            : safeT('已按区间归组') + '：' + p.channel + kind
+                + ' · ' + safeT('区间') + ' ' + (p.from || '') + ' ~ ' + (p.to || safeT('以后'));
         bar.appendChild(tag);
         const undo = document.createElement('button');
         undo.type = 'button';
@@ -5130,9 +5195,27 @@ function renderDayPatchBar(box, s, date) {
         patInp.value = list.length ? (list[0].pattern || '') : '';
         form.appendChild(patInp);
 
+        // v2.9.5 区间：勾上后填结束日（留空 = 从当天起一直往后），免得一天一天打补丁
+        const rangeLine = document.createElement('label');
+        rangeLine.className = 'tf-check';
+        const rangeCb = document.createElement('input');
+        rangeCb.type = 'checkbox';
+        rangeCb.checked = false;
+        rangeCb.addEventListener('change', () => { endInp.style.display = rangeCb.checked ? '' : 'none'; });
+        rangeLine.appendChild(rangeCb);
+        rangeLine.appendChild(document.createTextNode(' ' + safeT('做成区间（覆盖一段日子）')));
+        form.appendChild(rangeLine);
+
+        const endInp = document.createElement('input');
+        endInp.type = 'date';
+        endInp.className = 'text_pole tf-origin-inp';
+        endInp.placeholder = safeT('结束日（留空 = 从这天起一直往后）');
+        endInp.style.display = 'none';
+        form.appendChild(endInp);
+
         const note = document.createElement('div');
         note.className = 'tf-writing-hint';
-        note.textContent = safeT('只影响没有来源信息的老记录；新版记录的真实口径不受影响，随时可撤销');
+        note.textContent = safeT('只影响没有来源信息的老记录；新版记录的真实口径不受影响，随时可撤销。区间补丁对区间里的每一天都生效');
         form.appendChild(note);
 
         const row = document.createElement('div');
@@ -5141,10 +5224,20 @@ function renderDayPatchBar(box, s, date) {
             const channel = sel.value;
             if (!channel) { tfNotify(safeT('还没有可用渠道')); return; }
             const pattern = String(patInp.value || '').trim().toLowerCase();
-            // 同一天 + 同范围 = 覆盖更新，避免重复补丁叠罗汉
-            const idx = s.dayPatches.findIndex((p) => p && p.date === date && (p.pattern || '') === pattern);
-            if (idx >= 0) s.dayPatches[idx] = { date, pattern, channel };
-            else s.dayPatches.push({ date, pattern, channel });
+            if (rangeCb.checked) {
+                const from = date;
+                const to = String(endInp.value || '').trim();
+                // 同区间 + 同前缀 = 覆盖更新
+                const idx = s.dayPatches.findIndex((p) => p && !p.date && String(p.from || '') === from
+                    && String(p.to || '') === to && (p.pattern || '') === pattern);
+                if (idx >= 0) s.dayPatches[idx] = { from, to, pattern, channel };
+                else s.dayPatches.push({ from, to, pattern, channel });
+            } else {
+                // 同一天 + 同前缀 = 覆盖更新，避免重复补丁叠罗汉
+                const idx = s.dayPatches.findIndex((p) => p && p.date === date && (p.pattern || '') === pattern);
+                if (idx >= 0) s.dayPatches[idx] = { date, pattern, channel };
+                else s.dayPatches.push({ date, pattern, channel });
+            }
             tfPatchDraftOpen = false;
             saveSettingsDebounced();
             safeUpdateUI();

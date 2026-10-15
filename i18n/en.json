@@ -270,5 +270,13 @@
   "（整天）": "(whole day)",
   "撤销这一条归组": "Undo this assignment",
   "（仅 ": "(only ",
-  " 开头）": "-prefixed)"
+  " 开头）": "-prefixed)",
+  "做成区间（覆盖一段日子）": "Make it a range (cover a period)",
+  "结束日（留空 = 从这天起一直往后）": "End date (empty = from this day on)",
+  "只影响没有来源信息的老记录；新版记录的真实口径不受影响，随时可撤销。区间补丁对区间里的每一天都生效": "Only affects old records without source data; real sources of new records untouched, revertible anytime. Range patches apply to EVERY day in the range.",
+  "已按区间归组": "Assigned by range",
+  "区间": "Range",
+  "以后": "onwards",
+  "已有的归组补丁（单日/区间）": "Existing day/range assignments",
+  "单日": "Day"
 }
