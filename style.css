@@ -211,7 +211,9 @@
     border-radius: 999px;
     background: color-mix(in srgb, var(--tf-text, var(--SmartThemeBodyColor, #ccc)) 14%, transparent);
     margin-top: 7px;
-    overflow: hidden;
+    /* v2.9.7（审查第 13 条）：overflow:hidden 把 top:-9px 的占比标签整块裁掉，
+       数字永远看不见。fill 自带圆角，无需靠裁切 —— 开放裁剪让标签露出。 */
+    overflow: visible;
 }
 
 .tf-model-bar-fill {
