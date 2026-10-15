@@ -3361,7 +3361,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.8.0';
+const TF_VERSION = '2.9.3';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
@@ -4534,23 +4534,27 @@ function tfAggregateRange(s, range) {
             for (const k of keys) pushChannel(tfChannelOfSource(s, k) || safeT('未归类'), entry.sources[k]);
             return;
         }
+        // v2.9.3：这里原来在「有没有补丁」的判断**外面**读取 patch.pattern ——
+        // 一个真机热修复：没有补丁的日常记录聚到这里，直接在 undefined 上读
+        // pattern 抛异常，整块统计聚合失败（真机表现为「统计不渲染」）。
+        // 现在全部读写都收进 patch 存在的分支。
         const patch = dayDate ? patchesByDate.get(String(dayDate)) : null;
-        // v2.9.1 修复：按「归一化后的模型名」匹配补丁前缀。
+        if (!patch) {
+            pushChannel(safeT('未知（旧记录）'), entry);
+            return;
+        }
+        // v2.9.1 起按「归一化后的模型名」匹配补丁前缀：
         // 酒馆发上来的名字常带装饰（假流式- / [NV] / vendor/ / -preview 等），
-        // 直接 startsWith 会漏掉 「假流式-gemini-3.1-pro-preview」 这类；
-        // 归一化剥掉装饰后是 gemini-3.1-pro，和用户填的 「gemini」 正常命中。
-        // 旧的原始名前缀匹配保留为兜底（两个都中才算？不——任一命中即归组）。
+        // 归一化剥掉装饰后比对，旧的原始名前缀匹配保留为兜底，任一命中即归组。
         const pat = String(patch.pattern || '').trim().toLowerCase();
-        if (patch && !pat) {
+        if (!pat) {
             pushChannel(patch.channel, entry);
-        } else if (patch) {
-            const canon = tfCanonicalModel(String(name || ''));
-            const patCanon = tfCanonicalModel(pat);
-            if (canon.startsWith(patCanon) || String(name || '').toLowerCase().startsWith(pat)) {
-                pushChannel(patch.channel, entry);
-            } else {
-                pushChannel(safeT('未知（旧记录）'), entry);
-            }
+            return;
+        }
+        const canon = tfCanonicalModel(String(name || ''));
+        const patCanon = tfCanonicalModel(pat);
+        if (canon.startsWith(patCanon) || String(name || '').toLowerCase().startsWith(pat)) {
+            pushChannel(patch.channel, entry);
         } else {
             pushChannel(safeT('未知（旧记录）'), entry);
         }
