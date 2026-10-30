@@ -5,6 +5,15 @@ import {
 } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { t } from '../../../i18n.js';
+// v2.10.0：厂商模型目录（静态快照，随插件发布；不联网）
+import {
+    TF_BUILTIN_CATALOG,
+    TF_CATALOG_SCHEMA,
+    TF_CATALOG_UPDATED_AT,
+    TF_CATALOG_CURRENCY,
+    TF_CATALOG_CAPABILITIES,
+    TF_CATALOG_STATUS_NOTE,
+} from './catalog.js';
 
 // 安全获取 SillyTavern 上下文（world-backstage 验证过的模式）
 function getContext() {
@@ -26,6 +35,19 @@ const GENERATE_ENDPOINT = '/api/backends/chat-completions/generate';
 const STREAM_DONE = '[DONE]';
 // v2.9.9：主题白名单 —— getSettings 校验与面板主题菜单共用这一份，免得两处各写各的
 const TF_THEMES = ['cyber-royal', 'ink-zen', 'aurora-midnight', 'molten-gold', 'mono-white'];
+
+/* ===== v2.10.0：悬浮窗缩放档位 =====
+ * 范围与步长是产品口径，写死在这里，UI（按钮/快捷键/设置区）都读这一份。
+ * 为什么用离散档位而不是连续滑块：面板宽度是 JS 按档位算的，连续值会让
+ * 「记忆上次尺寸」在跨设备恢复时产生 0.5px 级差异，真机上没意义还可疑。
+ */
+const TF_ZOOM_LEVELS = [80, 90, 100, 110, 120, 130, 140];
+const TF_ZOOM_DEFAULT = 100;
+const TF_ZOOM_STEP = 10;
+const TF_ZOOM_NARROW_VW = 400;    // 视口小于这个宽度算「窄屏」
+const TF_ZOOM_NARROW_MAX = 120;   // 窄屏上的放大上限（再大面板就只剩表头了）
+let tfZoomMode = 'pending';       // 'ok' | 'window-only' | 'off'
+let tfZoomHintShown = false;
 
 // 2026 最新旗舰定价（$/1M token，cached 为缓存输入价）
 // Kimi 官方为 CNY，已按 ~7.1 汇率折算为 USD 基准
@@ -111,6 +133,15 @@ const defaultSettings = {
     // v2.9.9：用户明确删掉的预设型号（小写名）。存在这里，否则「补旗舰」逻辑
     // 会在下一次 getSettings() 把它整条加回来 —— 删除按钮等于没用
     removedPresets: [],
+    // ===== v2.10.0：悬浮窗缩放 =====
+    // 档位 80~140（%），默认 100；写入 settings 后跨页面/跨设备记忆
+    panelZoom: 100,
+    // ===== v2.10.0：厂商目录（静态快照 + 手动导入） =====
+    // null = 使用内置 catalog.js；导入/编辑后物化为完整对象
+    catalog: null,
+    catalogSource: 'builtin',   // builtin | imported | edited
+    catalogUpdatedAt: null,     // 目录数据自带的时间戳（内置时为 null，取内置常量）
+    catalogImportedAt: null,    // 本地导入/编辑时刻（毫秒）
 };
 
 // v2.9.9：价格字段名（getSettings 兜底与 priceHasValue 共用一份）
@@ -295,6 +326,23 @@ function getSettings() {
     // v2.9.9：主题白名单（README 第 26 节宣称过、代码里一直没做）。
     // setAttribute 本身不会注入，但非法主题会让面板整体退回兜底配色。
     if (typeof s.theme !== 'string' || !TF_THEMES.includes(s.theme)) s.theme = defaultSettings.theme;
+    // ===== v2.10.0：缩放档位 / 目录（导入与手改都可能塞进脏值） =====
+    // 档位必须落在白名单里：面板会把 panelZoom/100 直接写进 CSS 变量，
+    // 手改成一个字符串或 0 会让整块 UI 缩到看不见（或字号算成 NaN）。
+    const zoomNum = Number(s.panelZoom);
+    s.panelZoom = TF_ZOOM_LEVELS.includes(zoomNum) ? zoomNum : TF_ZOOM_DEFAULT;
+    // 目录：非对象 → 回到内置；对象但结构不对 → 也回内置（宁可显示旧快照，别整页空）
+    if (s.catalog !== null && (typeof s.catalog !== 'object' || !Array.isArray(s.catalog.vendors))) {
+        s.catalog = null;
+        s.catalogSource = 'builtin';
+    }
+    if (!['builtin', 'imported', 'edited'].includes(s.catalogSource)) s.catalogSource = 'builtin';
+    if (typeof s.catalogUpdatedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s.catalogUpdatedAt || '')) {
+        s.catalogUpdatedAt = null;
+    }
+    if (typeof s.catalogImportedAt !== 'number' || !Number.isFinite(s.catalogImportedAt) || s.catalogImportedAt <= 0) {
+        s.catalogImportedAt = null;
+    }
     return s;
 }
 
@@ -1842,6 +1890,9 @@ function makeInput(id, type, initial, oninput) {
 
 function updateDashboard() {
     applyTheme();
+    // v2.10.0：面板可能从多个入口打开（悬浮球/设置按钮/快捷键/跨设备同步），
+    // 每次都把缩放档位同步到 UI —— 只是写一个 CSS 变量 + 一个标签，开销可以忽略。
+    tfApplyPanelZoom();
     // 优先渲染到悬浮球弹层（主统计页），回退到设置面板内嵌容器
     const el = document.getElementById('token_flow_panel_body') || document.getElementById('token_flow_dashboard');
     if (!el) return;
@@ -2668,6 +2719,138 @@ function tfPanelOk(panel, vh) {
     } catch { return false; }
 }
 
+/* ---------- v2.10.0：悬浮窗缩放 ----------
+
+ * 为什么不用 transform: scale / CSS zoom：
+ *   面板定位（v2.8.0 起）是「实测矩形 → 反算 left/top」，transform 与 zoom 都会让
+ *   getBoundingClientRect 与写入值脱钩，等于把刚修稳的定位再砸一遍。
+ * 这里的做法是两条腿：
+ *   ① 字号：--tf-zoom 写在 .tf-panel 上，样式表里 font-size 统一乘这个变量；
+ *   ② 窗口：宽度上限按 720px × 档位 计算，仍受「视口 − 边距」钳制（旧规则不动）。
+ * 两者都不生效时降级为「仅窗口」，连按钮都点不了时标记 off 并把原因写进运行日志。
+ */
+
+/** 用户偏好的档位（持久化在 settings.panelZoom，跨页面/跨设备记忆） */
+function tfZoomLevel(s = null) {
+    const src = s || getSettings();
+    const n = Number(src && src.panelZoom);
+    return TF_ZOOM_LEVELS.includes(n) ? n : TF_ZOOM_DEFAULT;
+}
+
+/** 当前视口允许的档位区间（窄屏把上限收到 120%，避免只剩一条表头） */
+function tfZoomLimits() {
+    let vw = 0;
+    try { vw = tfViewport(window).vw; } catch { vw = 0; }
+    const narrow = vw > 0 && vw < TF_ZOOM_NARROW_VW;
+    return {
+        min: TF_ZOOM_LEVELS[0],
+        max: narrow ? TF_ZOOM_NARROW_MAX : TF_ZOOM_LEVELS[TF_ZOOM_LEVELS.length - 1],
+    };
+}
+
+/** 实际生效的档位：偏好档位被当前视口钳一次（不写回 settings，
+ *  这样在手机上临时被钳到 120%，回到电脑仍是用户自己选的 140%） */
+function tfZoomEff() {
+    const { min, max } = tfZoomLimits();
+    return Math.max(min, Math.min(max, tfZoomLevel()));
+}
+
+function tfZoomFactor() {
+    return tfZoomEff() / 100;
+}
+
+/** 把档位写进 UI（CSS 变量 + 百分比标签 + 边界禁用态） */
+function tfApplyPanelZoom() {
+    const level = tfZoomEff();
+    const { min, max } = tfZoomLimits();
+    const panel = document.getElementById('token_flow_panel');
+    if (panel) {
+        panel.style.setProperty('--tf-zoom', String(level / 100));
+        try { panel.dataset.tfZoom = String(level); } catch { /* ignore */ }
+    }
+    const label = document.getElementById('token_flow_zoom_level');
+    if (label) {
+        label.textContent = level + '%';
+        const tip = [safeT('点击恢复 100%')];
+        if (tfZoomMode === 'window-only') tip.push(safeT('当前环境只能缩放窗口'));
+        if (level !== tfZoomLevel()) tip.push(safeT('已按屏幕上限显示'));
+        label.title = tip.join(' · ');
+    }
+    const outBtn = document.getElementById('token_flow_zoom_out');
+    const inBtn = document.getElementById('token_flow_zoom_in');
+    if (outBtn) { outBtn.disabled = level <= min; outBtn.setAttribute('aria-disabled', String(outBtn.disabled)); }
+    if (inBtn) { inBtn.disabled = level >= max; inBtn.setAttribute('aria-disabled', String(inBtn.disabled)); }
+    return level;
+}
+
+/**
+ * 自检：字号到底有没有跟着变量变？
+ * 正常 → ok（字号 + 窗口都变）；字号没变 → window-only（只缩窗口，按钮仍可用）。
+ * 只在档位 ≠ 100 时判定 —— 100% 下「没变化」本来就是预期，判不出东西。
+ */
+function tfVerifyPanelZoom() {
+    const panel = document.getElementById('token_flow_panel');
+    if (!panel) { tfZoomMode = 'off'; return tfZoomMode; }
+    const level = tfZoomEff();
+    if (level === 100) { tfZoomMode = 'ok'; return tfZoomMode; }
+    let got = 0;
+    try {
+        const probe = panel.querySelector('.tf-panel-title b') || panel;
+        got = parseFloat(window.getComputedStyle(probe).fontSize) || 0;
+    } catch { got = 0; }
+    const want = 16 * (level / 100);   // .tf-panel-title b 的基准字号（style.css）
+    const prev = tfZoomMode;
+    if (!got) tfZoomMode = 'window-only';
+    else tfZoomMode = Math.abs(got - want) <= 1.5 ? 'ok' : 'window-only';
+
+    if (prev !== tfZoomMode) {
+        tfLog(tfZoomMode === 'ok' ? 'info' : 'warn', 'ui.zoom',
+            tfZoomMode === 'ok' ? '面板缩放正常（字号 + 窗口）' : '面板缩放降级：只缩窗口，字号未变',
+            { mode: tfZoomMode, level, fontSize: got, expected: Math.round(want * 10) / 10 });
+        if (tfZoomMode === 'window-only' && !tfZoomHintShown) {
+            tfZoomHintShown = true;
+            try {
+                globalThis.Toast?.warning?.(
+                    safeT('当前环境无法缩放字号，已改为只调整窗口大小'),
+                    'SillyToken', { timeOut: 6000, closeButton: true });
+            } catch { /* 没有 Toast 就只写日志 */ }
+        }
+    }
+    return tfZoomMode;
+}
+
+/** 调档：clamp 到当前视口区间；成功则落盘、重摆、自检 */
+function tfSetZoom(level, opts = {}) {
+    const s = getSettings();
+    const { min, max } = tfZoomLimits();
+    const want = Number(level);
+    const next = Math.max(min, Math.min(max, Number.isFinite(want) ? Math.round(want) : TF_ZOOM_DEFAULT));
+    const cur = tfZoomEff();
+    if (next === cur) {
+        if (opts.announce !== false) {
+            try {
+                globalThis.Toast?.system?.(
+                    next >= max ? safeT('已到最大档') + ' ' + max + '%' : safeT('已到最小档') + ' ' + min + '%',
+                    'SillyToken', { timeOut: 2500 });
+            } catch { /* ignore */ }
+        }
+        return cur;
+    }
+    s.panelZoom = next;
+    saveSettingsDebounced();
+    tfApplyPanelZoom();
+    // 宽度上限变了：允许重新摆位（否则定位冻结会把旧宽度一直复用）
+    tfLastGeom = null;
+    tfSyncFloatingGeometry();
+    tfVerifyPanelZoom();
+    tfLog('info', 'ui.zoom', '面板缩放 ' + next + '%', { level: next, mode: tfZoomMode });
+    return next;
+}
+
+function tfStepZoom(dir) {
+    return tfSetZoom(tfZoomEff() + dir * TF_ZOOM_STEP);
+}
+
 function tfSyncFloatingGeometry() {
     try {
         const win = window;
@@ -2676,6 +2859,10 @@ function tfSyncFloatingGeometry() {
         const M = TF_OVERLAY_MARGIN;
         // px 缩放系数：根元素被 zoom 时，写进去的 px 会被再乘一次，这里除掉
         const S = tfPixelScale(win);
+
+        // v2.10.0：视口一变（旋转 / 地址栏收放 / 桌面↔手机）允许的档位可能变，
+        // 这里顺手把标签与变量刷一遍；不递归、不触发重摆。
+        tfApplyPanelZoom();
 
         const scrim = document.getElementById('token_flow_panel_scrim');
         if (scrim && scrim.style.display !== 'none') {
@@ -2707,7 +2894,9 @@ function tfSyncFloatingGeometry() {
 
         // ① 先钳高度（关键：位置只由视口决定，绝不由内容高度决定）
         const natural = panel.getBoundingClientRect().height || 0;
-        const W = Math.max(240, Math.min(720, vw - 2 * M));
+        // v2.10.0：宽度上限跟着缩放档位走（80% → 576px，140% → 1008px，再被视口钳住）
+        const Z = tfZoomFactor();
+        const W = Math.max(240, Math.min(720 * Z, vw - 2 * M));
         const H = Math.max(140, Math.min(natural, vh - 2 * M));
 
         // ② 再算位置：窄屏贴底、宽屏居中，都落在 [M, vh − M − H]
@@ -2804,6 +2993,14 @@ function ensureFloatingUI() {
                     <span>${safeT('用量统计')}</span>
                 </div>
                 <div class="tf-panel-header-right">
+                    <div class="tf-zoom" id="token_flow_zoom" role="group" aria-label="${safeT('面板缩放')}">
+                        <button class="tf-zoom-btn" id="token_flow_zoom_out" type="button"
+                                title="${safeT('缩小面板')}（Alt+-）" aria-label="${safeT('缩小面板')}">−</button>
+                        <button class="tf-zoom-level" id="token_flow_zoom_level" type="button"
+                                title="${safeT('点击恢复 100%')}" aria-label="${safeT('面板缩放')}">100%</button>
+                        <button class="tf-zoom-btn" id="token_flow_zoom_in" type="button"
+                                title="${safeT('放大面板')}（Alt++）" aria-label="${safeT('放大面板')}">+</button>
+                    </div>
                     <div class="tf-theme-switcher" id="token_flow_theme_switcher" title="${safeT('主题')}">
                         <button class="tf-theme-switch-btn menu_button" type="button" title="${safeT('切换主题')}"><i class="fa-solid fa-palette"></i></button>
                         <div class="tf-theme-menu" id="token_flow_theme_menu">
@@ -2813,6 +3010,7 @@ function ensureFloatingUI() {
                         </div>
                     </div>
                     <div class="tf-panel-actions">
+                        <button class="tf-panel-more menu_button tf-more-btn" id="token_flow_more_btn" type="button" title="${safeT('更多操作')}" aria-label="${safeT('更多操作')}" aria-expanded="false"><i class="fa-solid fa-ellipsis"></i></button>
                         <button class="tf-panel-copy menu_button" id="token_flow_copy_summary" type="button" title="${safeT('复制用量摘要')}"><i class="fa-solid fa-copy"></i></button>
                         <button class="tf-panel-auto menu_button" id="token_flow_auto_refresh" type="button" title="${safeT('自动刷新')}"><i class="fa-solid fa-rotate"></i></button>
                         <button class="tf-panel-dl menu_button" id="token_flow_dl_backup" type="button" title="${safeT('导出备份')}"><i class="fa-solid fa-download"></i></button>
@@ -2987,6 +3185,35 @@ function ensureFloatingUI() {
     refreshBtn.addEventListener('click', safeUpdateUI);
     resetBtn.addEventListener('click', resetSessionStats);
 
+    // ===== v2.10.0：缩放按钮（表头右侧，主题按钮左边） =====
+    const zoomOutBtn = document.getElementById('token_flow_zoom_out');
+    const zoomInBtn = document.getElementById('token_flow_zoom_in');
+    const zoomLevelBtn = document.getElementById('token_flow_zoom_level');
+    if (zoomOutBtn) zoomOutBtn.addEventListener('click', (e) => { e.stopPropagation(); tfStepZoom(-1); });
+    if (zoomInBtn) zoomInBtn.addEventListener('click', (e) => { e.stopPropagation(); tfStepZoom(1); });
+    if (zoomLevelBtn) {
+        zoomLevelBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            tfSetZoom(TF_ZOOM_DEFAULT);
+        });
+        // 桌面端习惯：双击回到默认档（手机端双击会触发缩放，故不绑）
+        zoomLevelBtn.addEventListener('dblclick', (e) => { e.preventDefault(); tfSetZoom(TF_ZOOM_DEFAULT); });
+    }
+    tfApplyPanelZoom();
+    tfVerifyPanelZoom();
+
+    // v2.10.0：窄屏折叠 —— 手机表头放不下 6 个图标按钮，
+    // 收进「⋯」里（关闭按钮始终可见）。桌面端这层不生效，按钮照旧全平铺。
+    const moreBtn = document.getElementById('token_flow_more_btn');
+    const actionsBar = document.querySelector('#token_flow_panel .tf-panel-actions');
+    if (moreBtn && actionsBar) {
+        moreBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const open = actionsBar.classList.toggle('is-open');
+            moreBtn.setAttribute('aria-expanded', String(open));
+        });
+    }
+
     // ===== v1.4.0：主题切换下拉 + 快捷功能 =====
     const themeSwitchBtn = document.querySelector('#token_flow_theme_switcher .tf-theme-switch-btn');
     const themeMenu = document.getElementById('token_flow_theme_menu');
@@ -3069,6 +3296,15 @@ function ensureFloatingUI() {
             scrim.style.display = 'none';
             orb.classList.remove('is-open');
             return;
+        }
+        // ===== v2.10.0：桌面端缩放缓捷键（面板开着才响应，避免和宿主抢按键） =====
+        // 用 Alt 而不是 Ctrl/Cmd：Ctrl+±/0 是浏览器自己的页面缩放，抢过来会让人以为坏了
+        if (panel.style.display !== 'none' && e.altKey && !e.ctrlKey && !e.metaKey) {
+            const k = String(e.key || '');
+            // 只认 +/-/0：方向键在不同宿主里另有用途（滚动面板正文），不抢
+            if (k === '=' || k === '+') { e.preventDefault(); tfStepZoom(1); return; }
+            if (k === '-' || k === '_') { e.preventDefault(); tfStepZoom(-1); return; }
+            if (k === '0') { e.preventDefault(); tfSetZoom(TF_ZOOM_DEFAULT); return; }
         }
         // ===== v1.4.0：全局快捷键 Ctrl+Shift+T 开/关悬浮球面板 =====
         if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && String(e.key).toLowerCase() === 't') {
@@ -3206,10 +3442,38 @@ function addExtensionSettingsInto(content) {
         updateOrbBadge();   // 关掉再打开时，角标状态要跟着回来
     });
 
+    // ===== v2.10.0：面板缩放（表头按钮的第二个入口，状态同一份） =====
+    // 位置说明：表头右侧「− 百分比 +」是主入口；这里放一份是为了「找不到按钮时
+    // 还能在设置里调」，两边读写同一个 settings.panelZoom。
+    const zoomRow = document.createElement('div');
+    zoomRow.className = 'tf-btn-row tf-zoom-settings';
+    const mkZoomBtn = (text, title, onClick, cls) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'menu_button' + (cls ? ' ' + cls : '');
+        b.textContent = text;
+        b.title = title;
+        b.addEventListener('click', onClick);
+        return b;
+    };
+    const zsLabel = document.createElement('span');
+    zsLabel.className = 'tf-zoom-settings-label';
+    const syncZsLabel = () => { zsLabel.textContent = tfZoomEff() + '%'; };
+    zoomRow.appendChild(mkZoomBtn('−', safeT('缩小面板'), () => { tfStepZoom(-1); syncZsLabel(); }));
+    zoomRow.appendChild(mkZoomBtn('100%', safeT('点击恢复 100%'), () => { tfSetZoom(TF_ZOOM_DEFAULT); syncZsLabel(); }, 'tf-zoom-reset'));
+    zoomRow.appendChild(mkZoomBtn('+', safeT('放大面板'), () => { tfStepZoom(1); syncZsLabel(); }));
+    zoomRow.appendChild(zsLabel);
+    syncZsLabel();
+    row(span(safeT('面板缩放')), zoomRow);
+    // 说明：范围与记忆方式写在这里，省得用户猜
+    const zoomHint = document.createElement('div');
+    zoomHint.className = 'tf-settings-hint tf-zoom-hint';
+    zoomHint.textContent = safeT('范围 80%–140%，默认 100%；会记住上次档位。面板表头右上角的 −/+ 是同一个开关。');
+    wrap.appendChild(zoomHint);
+
     // 打开统计面板按钮
     const openBtnRow = document.createElement('div');
-    openBtnRow.className = 'tf-btn-row';
-    const openBtn = document.createElement('button');
+    openBtnRow.className = 'tf-btn-row';    const openBtn = document.createElement('button');
     openBtn.textContent = safeT('打开统计面板');
     openBtn.className = 'menu_button';
     openBtn.addEventListener('click', () => {
@@ -3660,7 +3924,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.9.9';
+const TF_VERSION = '2.10.0';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
@@ -3999,7 +4263,7 @@ function renderManagePage(container, s) {
     page.className = 'tf-manage';
     const subbar = document.createElement('div');
     subbar.className = 'tf-subtabs';
-    for (const sub of [['models', '模型价格'], ['channels', '渠道']]) {
+    for (const sub of [['models', '模型价格'], ['catalog', '厂商目录'], ['channels', '渠道']]) {
         const b = document.createElement('button');
         b.type = 'button';
         b.className = 'tf-subtab-btn' + (tfManageSub === sub[0] ? ' active' : '');
@@ -4011,6 +4275,12 @@ function renderManagePage(container, s) {
 
     if (tfManageSub === 'channels') {
         renderChannelsSub(page, s);
+    } else if (tfManageSub === 'catalog') {
+        // 目录子页单独包一层 .tf-cat-root：搜索/筛选/导入预览只重绘这块，整页不闪
+        const root = document.createElement('div');
+        root.className = 'tf-cat-root';
+        page.appendChild(root);
+        renderCatalogSub(root, s);
     } else {
         renderModelsSub(page, s);
     }
@@ -4495,6 +4765,831 @@ function renderChannelsSub(container, s) {
         btnRow.appendChild(tfButton(safeT('取消'), () => { tfNewChannelOpen = false; safeUpdateUI(); }, 'tf-diag-btn'));
         form.appendChild(btnRow);
         container.appendChild(form);
+    }
+}
+
+/* ============================================================
+ *  v2.10.0 · 厂商模型目录（静态快照 + 手动导入）
+ *
+ *  设计约束（为什么长这样）：
+ *   1. 插件不发网络请求 —— 目录只能是「随版本发布的快照」或「用户手动导入」，
+ *      所以这里没有 fetch、没有定时器、没有任何自动更新。
+ *   2. 目录里的价格是**参考价**，与用户价表是两份数据。两者不一致时只标「差异」，
+ *      必须用户点「采用参考价」才写入价表 —— 绝不静默改钱。
+ *   3. 查不到的字段显示「未收录」而不是 0 —— 猜一个数字比留空更糟。
+ *   4. 未知模型（用量里出现、目录里没有）单独列，一键收录，不做模糊猜测。
+ * ============================================================ */
+
+const TF_CAP_LABEL = {
+    text: '文本', vision: '视觉', audio: '音频', tools: '工具',
+    reasoning: '推理', caching: '缓存', image_gen: '生图',
+};
+
+let tfCatalogQuery = '';
+let tfCatalogVendor = 'all';
+let tfCatalogImportOpen = false;
+let tfCatalogImportText = '';
+let tfCatalogImportResult = null;      // { ok, errors, data, counts }
+let tfCatalogImportPrices = false;     // 导入时是否同时覆盖价表里已有模型的单价
+
+/** 当前生效的目录对象（自定义优先，结构不对就回内置） */
+function tfCatalogData(s) {
+    const c = s && s.catalog;
+    if (c && typeof c === 'object' && Array.isArray(c.vendors)) return c;
+    return TF_BUILTIN_CATALOG;
+}
+
+function tfCatalogIsBuiltin(s) {
+    const c = s && s.catalog;
+    return !(c && typeof c === 'object' && Array.isArray(c.vendors));
+}
+
+/** 目录时间戳：{ date: 'YYYY-MM-DD', days: 距今天数, stale: 超 90 天 } */
+function tfCatalogStamp(s) {
+    const data = tfCatalogData(s);
+    let date = String(data.updatedAt || TF_CATALOG_UPDATED_AT || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) date = TF_CATALOG_UPDATED_AT;
+    let days = null;
+    try {
+        const t = new Date(date + 'T00:00:00').getTime();
+        if (Number.isFinite(t)) days = Math.max(0, Math.floor((Date.now() - t) / 86400000));
+    } catch { days = null; }
+    return { date, days, stale: days !== null && days > 90 };
+}
+
+/** 目录 id / 价表名归一到同一把尺子：点号与横线视为同一个分隔符 */
+function tfNormModelId(name) {
+    return tfCanonicalModel(name).replace(/\./g, '-');
+}
+
+/** 在价表里找这条目录模型对应的条目（精确 id / 别名，不做模糊） */
+function tfCatalogPriceEntry(s, entry) {
+    if (!entry) return null;
+    const want = new Set([entry.id, ...(Array.isArray(entry.aliases) ? entry.aliases : [])]
+        .filter(Boolean).map(tfNormModelId));
+    const models = Array.isArray(s && s.models) ? s.models : [];
+    for (const m of models) {
+        if (!m || typeof m !== 'object') continue;
+        const cands = [m.name, ...tfAliasList(m)].filter(Boolean).map(tfNormModelId);
+        if (cands.some((c) => want.has(c))) return m;
+    }
+    return null;
+}
+
+/** 可用性判定：状态只由「目录状态 + 价表是否收录/有价」决定，可复现 */
+function tfCatalogStatusOf(s, entry) {
+    const pe = tfCatalogPriceEntry(s, entry);
+    const priced = pe && (tfNum(pe.input) + tfNum(pe.output) + tfNum(pe.cached) + tfNum(pe.perRequest)) > 0;
+    if (entry.status === 'deprecated') return { key: 'deprecated', label: '厂商已弃用', tone: 'muted' };
+    if (!pe) return { key: 'notinprice', label: '价表未收录', tone: 'muted' };
+    if (!priced) return { key: 'zero', label: '已收录·未定价', tone: 'warn' };
+    if (entry.status === 'unverified') return { key: 'unverified', label: '可用·未核对', tone: 'ok' };
+    if (entry.status === 'preview') return { key: 'preview', label: '可用·预览版', tone: 'ok' };
+    return { key: 'ok', label: '可用', tone: 'ok' };
+}
+
+/** 目录参考价 vs 价表：返回有差异的字段名数组（无差异/无参考价 → 空数组） */
+function tfCatalogPriceDiff(entry, pe) {
+    if (!entry || !entry.prices || !pe) return [];
+    const out = [];
+    for (const f of ['input', 'output', 'cached']) {
+        const a = entry.prices[f];
+        if (typeof a !== 'number' || !Number.isFinite(a)) continue;
+        if (Math.abs(tfNum(pe[f]) - a) > 1e-9) out.push(f);
+    }
+    return out;
+}
+
+/** 价表里有、目录里没有的模型（手动维护时最常见的缺口） */
+function tfCatalogPriceTableOnly(s) {
+    const data = tfCatalogData(s);
+    const known = new Set();
+    for (const v of data.vendors) {
+        for (const m of v.models) {
+            known.add(tfNormModelId(m.id));
+            for (const a of (m.aliases || [])) known.add(tfNormModelId(a));
+        }
+    }
+    const models = Array.isArray(s && s.models) ? s.models : [];
+    return models
+        .filter((m) => m && typeof m === 'object' && m.name)
+        .filter((m) => !known.has(tfNormModelId(m.name)))
+        .map((m) => ({ name: m.name, input: tfNum(m.input), output: tfNum(m.output) }));
+}
+
+/** 用量里出现过、目录里没有的模型 —— 「未知模型」的唯一来源 */
+function tfCatalogUnknownModels(s) {
+    const data = tfCatalogData(s);
+    const known = new Set();
+    for (const v of data.vendors) {
+        for (const m of v.models) {
+            known.add(tfNormModelId(m.id));
+            for (const a of (m.aliases || [])) known.add(tfNormModelId(a));
+        }
+    }
+    const buckets = (s && s.stats && s.stats.models && typeof s.stats.models === 'object') ? s.stats.models : {};
+    const out = [];
+    for (const [name, bucket] of Object.entries(buckets)) {
+        if (!name || known.has(tfNormModelId(name))) continue;
+        if (!bucket || typeof bucket !== 'object') continue;
+        out.push({
+            name,
+            tokens: (tfNum(bucket.in) + tfNum(bucket.out) + tfNum(bucket.cached)),
+            req: tfNum(bucket.req),
+            priced: tfNum(bucket.cost) > 0,
+        });
+    }
+    return out.sort((a, b) => b.tokens - a.tokens);
+}
+
+/* ---------- 目录页：渲染 ---------- */
+
+function tfCatChip(text, tone) {
+    const el = document.createElement('span');
+    el.className = 'tf-chip-badge' + (tone ? ' is-' + tone : '');
+    el.textContent = text;
+    return el;
+}
+
+function renderCatalogSub(container, s) {
+    const data = tfCatalogData(s);
+    const stamp = tfCatalogStamp(s);
+
+    // ---- 工具行：搜索 + 厂商筛选 ----
+    const toolbar = document.createElement('div');
+    toolbar.className = 'tf-manage-toolbar';
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'text_pole tf-search';
+    search.placeholder = safeT('搜索厂商或模型…');
+    search.value = tfCatalogQuery;
+    search.addEventListener('input', () => { tfCatalogQuery = search.value; tfRerenderCatalog(container, s); });
+    toolbar.appendChild(search);
+
+    const sel = document.createElement('select');
+    sel.className = 'text_pole tf-cat-vendor-sel';
+    const optAll = document.createElement('option');
+    optAll.value = 'all';
+    optAll.textContent = safeT('全部厂商');
+    sel.appendChild(optAll);
+    for (const v of data.vendors) {
+        const o = document.createElement('option');
+        o.value = v.id;
+        o.textContent = v.name;
+        sel.appendChild(o);
+    }
+    sel.value = data.vendors.some((v) => v.id === tfCatalogVendor) ? tfCatalogVendor : 'all';
+    tfCatalogVendor = sel.value;
+    sel.addEventListener('change', () => { tfCatalogVendor = sel.value; tfRerenderCatalog(container, s); });
+    toolbar.appendChild(sel);
+    container.appendChild(toolbar);
+
+    // ---- 数据来源 / 更新时间 / 币种 ----
+    const meta = document.createElement('div');
+    meta.className = 'tf-cat-meta';
+    const srcLine = document.createElement('div');
+    srcLine.className = 'tf-cat-meta-line';
+    // 来源要如实区分三种：内置 / 导入 / 内置+本地编辑（编辑过就不再是「原样内置」）
+    const srcText = tfCatalogIsBuiltin(s)
+        ? safeT('数据来源：内置静态目录（人工检索厂商官方文档整理）')
+        : (s.catalogSource === 'edited'
+            ? safeT('数据来源：内置目录 + 你的编辑')
+            : safeT('数据来源：你导入的目录'));
+    srcLine.textContent = '📚 ' + srcText;
+    meta.appendChild(srcLine);
+
+    const timeLine = document.createElement('div');
+    timeLine.className = 'tf-cat-meta-line' + (stamp.stale ? ' is-warn' : '');
+    timeLine.textContent = '🕒 ' + safeT('目录更新于') + ' ' + stamp.date
+        + (stamp.days !== null ? '（' + stamp.days + ' ' + safeT('天前') + '）' : '')
+        // 用自定义目录时同时标出内置快照的日期：两个时间戳分开看，免得混淆
+        + (tfCatalogIsBuiltin(s) ? '' : ' · ' + safeT('内置') + ' ' + TF_CATALOG_UPDATED_AT)
+        + (stamp.stale ? ' · ' + safeT('建议刷新') : '');
+    meta.appendChild(timeLine);
+
+    const curLine = document.createElement('div');
+    curLine.className = 'tf-cat-meta-line';
+    curLine.textContent = '💱 ' + safeT('币种') + '：USD / 1M tokens'
+        + ' · ' + safeT('显示按') + ' ' + s.displayCurrency + '（' + safeT('汇率') + ' ' + s.exchangeRate + '）';
+    meta.appendChild(curLine);
+
+    if (s.catalogImportedAt) {
+        const impLine = document.createElement('div');
+        impLine.className = 'tf-cat-meta-line';
+        let when = '';
+        try { when = new Date(s.catalogImportedAt).toLocaleString(); } catch { when = ''; }
+        impLine.textContent = '📥 ' + safeT('上次导入') + '：' + when;
+        meta.appendChild(impLine);
+    }
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'tf-btn-row';
+    btnRow.appendChild(tfButton(tfCatalogImportOpen ? safeT('收起导入') : safeT('导入目录'), () => {
+        tfCatalogImportOpen = !tfCatalogImportOpen;
+        tfCatalogImportResult = null;
+        tfRerenderCatalog(container, s);
+    }, 'tf-diag-btn'));
+    btnRow.appendChild(tfButton(safeT('导出目录'), () => tfExportCatalog(s), 'tf-diag-btn'));
+    btnRow.appendChild(tfButton(safeT('恢复内置'), () => tfRestoreBuiltinCatalog(), 'tf-diag-btn'));
+    meta.appendChild(btnRow);
+    container.appendChild(meta);
+
+    if (tfCatalogImportOpen) renderCatalogImport(container, s);
+
+    // ---- 概览 ----
+    const summary = document.createElement('div');
+    summary.className = 'tf-cat-summary';
+    let totalModels = 0, priced = 0, unpriced = 0, deprecated = 0;
+    for (const v of data.vendors) {
+        for (const m of v.models) {
+            totalModels++;
+            const st = tfCatalogStatusOf(s, m);
+            if (st.key === 'deprecated') { deprecated++; continue; }
+            if (st.key === 'ok' || st.key === 'unverified' || st.key === 'preview') priced++;
+            else unpriced++;
+        }
+    }
+    summary.textContent = safeT('厂商') + ' ' + data.vendors.length
+        + ' · ' + safeT('模型') + ' ' + totalModels
+        + ' · ' + safeT('已定价') + ' ' + priced
+        + ' · ' + safeT('未定价') + ' ' + unpriced
+        + (deprecated ? ' · ' + safeT('厂商已弃用') + ' ' + deprecated : '');
+    container.appendChild(summary);
+
+    // ---- 厂商卡片 ----
+    const q = tfCatalogQuery.trim().toLowerCase();
+    let shown = 0;
+    for (const v of data.vendors) {
+        if (tfCatalogVendor !== 'all' && v.id !== tfCatalogVendor) continue;
+        const models = v.models.filter((m) => {
+            if (!q) return true;
+            return (v.name + ' ' + m.id + ' ' + (m.label || '')).toLowerCase().includes(q);
+        });
+        if (!models.length) continue;
+        shown += models.length;
+        container.appendChild(tfCatalogVendorCard(v, models, s));
+    }
+    if (!shown) {
+        const empty = document.createElement('div');
+        empty.className = 'tf-dash-muted';
+        empty.textContent = safeT('没有匹配的模型');
+        container.appendChild(empty);
+    }
+
+    // ---- 价表里有、目录没收录 ----
+    const onlyPrice = tfCatalogPriceTableOnly(s);
+    if (onlyPrice.length) {
+        const box = document.createElement('div');
+        box.className = 'tf-cat-block';
+        const head = document.createElement('div');
+        head.className = 'tf-cat-block-head';
+        head.textContent = '🧩 ' + safeT('价表里有、目录未收录') + '（' + onlyPrice.length + '）';
+        box.appendChild(head);
+        const hint = document.createElement('div');
+        hint.className = 'tf-writing-hint';
+        hint.textContent = safeT('这些模型能正常计费，只是厂商目录里没有它们的上下文/能力信息。');
+        box.appendChild(hint);
+        for (const m of onlyPrice.slice(0, 12)) {
+            const row = document.createElement('div');
+            row.className = 'tf-cat-row is-missing';
+            const nm = document.createElement('div');
+            nm.className = 'tf-cat-name';
+            nm.textContent = m.name;
+            row.appendChild(nm);
+            const meta2 = document.createElement('div');
+            meta2.className = 'tf-cat-sub';
+            meta2.textContent = '$' + m.input + ' / $' + m.output + ' · ' + safeT('来自你的价表');
+            row.appendChild(meta2);
+            const act = document.createElement('div');
+            act.className = 'tf-cat-act';
+            act.appendChild(tfCatChip(safeT('价表未收录到目录'), 'muted'));
+            row.appendChild(act);
+            box.appendChild(row);
+        }
+        container.appendChild(box);
+    }
+
+    // ---- 未知模型（用量里出现、目录里没有） ----
+    const unknown = tfCatalogUnknownModels(s);
+    if (unknown.length) {
+        const box = document.createElement('div');
+        box.className = 'tf-cat-block is-unknown';
+        const head = document.createElement('div');
+        head.className = 'tf-cat-block-head';
+        head.textContent = '❓ ' + safeT('未知模型（用量里出现、目录里没有）') + '（' + unknown.length + '）';
+        box.appendChild(head);
+        const hint = document.createElement('div');
+        hint.className = 'tf-writing-hint';
+        hint.textContent = safeT('不猜价格、不猜上下文：确认后可以收录进目录，或直接加进价表。');
+        box.appendChild(hint);
+        for (const u of unknown.slice(0, 20)) {
+            const row = document.createElement('div');
+            // 3 列布局（名称 / 用量 / 操作）：复用缺失块的窄列规则
+            row.className = 'tf-cat-row is-missing';
+            const nm = document.createElement('div');
+            nm.className = 'tf-cat-name';
+            nm.textContent = u.name;
+            row.appendChild(nm);
+            const sub = document.createElement('div');
+            sub.className = 'tf-cat-sub';
+            sub.textContent = fmtTokens(u.tokens) + ' tok · ' + u.req + ' ' + safeT('次');
+            row.appendChild(sub);
+            const act = document.createElement('div');
+            act.className = 'tf-cat-act';
+            act.appendChild(tfButton(safeT('收录进目录'), () => {
+                tfAdoptIntoCatalog(s, u.name);
+            }, 'tf-diag-btn'));
+            act.appendChild(tfButton(safeT('加入价表'), () => {
+                tfAdoptIntoPriceTable(s, u.name);
+            }, 'tf-diag-btn'));
+            row.appendChild(act);
+            box.appendChild(row);
+        }
+        container.appendChild(box);
+    }
+}
+
+function tfCatalogVendorCard(v, models, s) {
+    const card = document.createElement('div');
+    card.className = 'tf-cat-vendor';
+
+    const head = document.createElement('div');
+    head.className = 'tf-cat-vendor-head';
+    const nm = document.createElement('div');
+    nm.className = 'tf-cat-vendor-name';
+    nm.textContent = v.name;
+    head.appendChild(nm);
+
+    const src = document.createElement('span');
+    src.className = 'tf-chip-badge' + (v.sillyTavernSource ? ' is-ok' : ' is-muted');
+    src.textContent = v.sillyTavernSource
+        ? safeT('酒馆内置渠道') + '：' + v.sillyTavernSource
+        : safeT('酒馆无内置渠道（走自定义/OpenRouter）');
+    head.appendChild(src);
+
+    const cnt = document.createElement('span');
+    cnt.className = 'tf-cat-count';
+    cnt.textContent = models.length + ' ' + safeT('模型');
+    head.appendChild(cnt);
+    card.appendChild(head);
+
+    // 表头（窄屏隐藏，行内自己带标签）
+    const header = document.createElement('div');
+    header.className = 'tf-cat-row is-head';
+    for (const [t, cls] of [[safeT('模型'), 'tf-cat-name'], [safeT('上下文'), 'tf-cat-ctx'],
+        [safeT('能力'), 'tf-cat-caps'], [safeT('参考价') + ' (USD/1M)', 'tf-cat-price'],
+        [safeT('可用性'), 'tf-cat-state'], ['', 'tf-cat-act']]) {
+        const c = document.createElement('div');
+        c.className = cls;
+        c.textContent = t;
+        header.appendChild(c);
+    }
+    card.appendChild(header);
+
+    for (const m of models) {
+        card.appendChild(tfCatalogModelRow(v, m, s));
+    }
+    return card;
+}
+
+function tfCatalogModelRow(v, m, s) {
+    const row = document.createElement('div');
+    row.className = 'tf-cat-row';
+    const st = tfCatalogStatusOf(s, m);
+
+    const name = document.createElement('div');
+    name.className = 'tf-cat-name';
+    const idLine = document.createElement('div');
+    idLine.className = 'tf-cat-id';
+    idLine.textContent = m.id;
+    name.appendChild(idLine);
+    if (m.label && m.label !== m.id) {
+        const lab = document.createElement('div');
+        lab.className = 'tf-cat-label';
+        lab.textContent = m.label;
+        name.appendChild(lab);
+    }
+    row.appendChild(name);
+
+    const ctx = document.createElement('div');
+    ctx.className = 'tf-cat-ctx';
+    // 「未收录」而不是 0：查不到就是查不到，界面要如实说
+    ctx.textContent = (typeof m.context === 'number' && m.context > 0)
+        ? fmtTokens(m.context) + (m.maxOutput ? ' / ' + fmtTokens(m.maxOutput) : '')
+        : safeT('未收录');
+    if (!(typeof m.context === 'number' && m.context > 0)) ctx.classList.add('is-muted');
+    row.appendChild(ctx);
+
+    const caps = document.createElement('div');
+    caps.className = 'tf-cat-caps';
+    if (Array.isArray(m.capabilities) && m.capabilities.length) {
+        for (const c of m.capabilities) {
+            const b = document.createElement('span');
+            b.className = 'tf-cap-tag';
+            b.textContent = TF_CAP_LABEL[c] || c;
+            caps.appendChild(b);
+        }
+    } else {
+        caps.textContent = safeT('未收录');
+        caps.classList.add('is-muted');
+    }
+    row.appendChild(caps);
+
+    const price = document.createElement('div');
+    price.className = 'tf-cat-price';
+    const p = m.prices || {};
+    const fmt = (x) => (typeof x === 'number' && Number.isFinite(x)) ? String(x) : '—';
+    price.textContent = '$' + fmt(p.input) + ' / $' + fmt(p.output);
+    if (typeof p.cached === 'number' && Number.isFinite(p.cached)) {
+        const c2 = document.createElement('div');
+        c2.className = 'tf-cat-price-sub';
+        c2.textContent = safeT('缓存') + ' $' + fmt(p.cached);
+        price.appendChild(c2);
+    }
+    row.appendChild(price);
+
+    const state = document.createElement('div');
+    state.className = 'tf-cat-state';
+    state.appendChild(tfCatChip(st.label, st.tone));
+    const pe = tfCatalogPriceEntry(s, m);
+    const diff = tfCatalogPriceDiff(m, pe);
+    if (diff.length) {
+        const d = document.createElement('div');
+        d.className = 'tf-cat-diff';
+        d.textContent = '⚠ ' + safeT('与价表不同');
+        state.appendChild(d);
+    }
+    row.appendChild(state);
+
+    const act = document.createElement('div');
+    act.className = 'tf-cat-act';
+    // 有参考价 → 「采用参考价 / 加入价表」；没有参考价也留一个 0 价入口 ——
+    // 否则收录进来的模型在目录页无路可走，只能绕去「模型价格」页面（多两步）
+    const hasRef = ['input', 'output', 'cached'].some((f) => typeof p[f] === 'number' && Number.isFinite(p[f]));
+    const label = hasRef ? (pe ? safeT('采用参考价') : safeT('加入价表')) : safeT('加入价表');
+    act.appendChild(tfButton(label, () => tfApplyCatalogPrice(s, m), 'tf-diag-btn'));
+    if (!hasRef) {
+        const note = document.createElement('div');
+        note.className = 'tf-cat-diff';
+        note.textContent = safeT('无参考价（按 0 价占位）');
+        act.appendChild(note);
+    }
+    row.appendChild(act);
+    return row;
+}
+
+/* ---------- 目录页：动作 ---------- */
+
+/** 采用参考价：显式写入价表（新建或覆盖），然后重算费用 */
+function tfApplyCatalogPrice(s, entry) {
+    const p = entry.prices || {};
+    let target = tfCatalogPriceEntry(s, entry);
+    if (!target) {
+        target = { name: entry.id, input: 0, output: 0, cached: 0, perRequest: 0, multiplier: 1 };
+        s.models.push(target);
+    }
+    let changed = 0;
+    for (const f of ['input', 'output', 'cached', 'perRequest']) {
+        const val = tfNum(p[f]);
+        if (Math.abs(tfNum(target[f]) - val) > 1e-9) { target[f] = val; changed++; }
+    }
+    // 用户显式改过 → 打标记，后续内置价表升级不会覆盖它
+    target.userEdited = true;
+    if (!changed) { tfNotify(safeT('价表已经是这个价格')); return; }
+    recomputeAllCosts(s);
+    // 目录页改的是 s.models 本体，而「模型价格」子页可能开着一份旧草稿 ——
+    // 草稿里没有这条模型，点一次「保存并重算」就会把它覆盖掉。这里作废草稿，
+    // 下次进子页会用最新价表重建（v2.9.7 导入路径同样的处理）。
+    tfPriceDraft = null;
+    saveSettingsDebounced();
+    safeUpdateUI();
+    tfNotify(safeT('已写入价表并重算'));
+    tfLog('info', 'catalog.price', '采用目录参考价：' + entry.id, { fields: changed });
+}
+
+/** 把用量里的未知模型收进目录（上下文/能力留空，不猜） */
+function tfAdoptIntoCatalog(s, name) {
+    const data = structuredClone(tfCatalogData(s));
+    const vendor = { id: 'user', name: '自建 / 未归类', site: null, sillyTavernSource: null, models: [] };
+    const exists = data.vendors.some((v) => v.models.some((m) => tfNormModelId(m.id) === tfNormModelId(name)));
+    if (exists) { tfNotify(safeT('目录里已经有这个模型了')); return; }
+    vendor.models.push({
+        id: String(name),
+        label: String(name),
+        context: null,
+        maxOutput: null,
+        capabilities: [],
+        status: 'unverified',
+        prices: { input: null, output: null, cached: null, perRequest: null },
+        source: '手动收录（来自用量）',
+        checkedAt: _todayStr(),
+    });
+    const userVendor = data.vendors.find((v) => v.id === 'user');
+    if (userVendor) userVendor.models.push(...vendor.models);
+    else data.vendors.push(vendor);
+    s.catalog = data;
+    s.catalogSource = 'edited';
+    s.catalogUpdatedAt = _todayStr();
+    s.catalogImportedAt = Date.now();
+    saveSettingsDebounced();
+    safeUpdateUI();
+    tfNotify(safeT('已收录进目录（上下文待你补充）'));
+}
+
+/** 把未知模型加进价表（0 价占位，等你填） */
+function tfAdoptIntoPriceTable(s, name) {
+    const exists = (Array.isArray(s.models) ? s.models : []).some((m) => m && tfNormModelId(m.name) === tfNormModelId(name));
+    if (exists) { tfNotify(safeT('价表里已经有这个模型了')); return; }
+    s.models.push({ name: String(name), input: 0, output: 0, cached: 0, perRequest: 0, multiplier: 1, userEdited: true });
+    tfPriceDraft = null;
+    saveSettingsDebounced();
+    safeUpdateUI();
+    tfNotify(safeT('已加入价表（单价为 0，去「模型价格」里填）'));
+}
+
+/** 恢复内置目录：丢弃导入/编辑结果 */
+function tfRestoreBuiltinCatalog() {
+    const ask = (typeof globalThis.confirm === 'function') ? globalThis.confirm : null;
+    if (ask && !ask(safeT('恢复内置目录会丢弃你导入/编辑的目录（不影响价表与统计）。继续？'))) return;
+    const s = getSettings();
+    s.catalog = null;
+    s.catalogSource = 'builtin';
+    s.catalogUpdatedAt = null;
+    s.catalogImportedAt = null;
+    saveSettingsDebounced();
+    safeUpdateUI();
+    tfNotify(safeT('已恢复内置目录'));
+    tfLog('info', 'catalog.restore', '恢复内置目录 ' + TF_CATALOG_UPDATED_AT);
+}
+
+/** 导出当前目录（内置或导入的都行），方便离线编辑后再导回来 */
+function tfExportCatalog(s) {
+    const data = tfCatalogData(s);
+    const payload = {
+        schema: TF_CATALOG_SCHEMA,
+        updatedAt: _todayStr(),
+        currency: TF_CATALOG_CURRENCY,
+        notes: '由 SillyToken 导出；编辑后可在「厂商目录 → 导入目录」导回。',
+        vendors: data.vendors,
+    };
+    tfDownload('sillytoken-catalog-' + _todayStr() + '.json', JSON.stringify(payload, null, 2));
+}
+
+/* ---------- 目录页：导入（手动更新通道） ---------- */
+
+/**
+ * 校验并归一一份目录 JSON。**不可信输入**：这里逐字段重建对象，
+ * 不做 Object.assign（那会把 __proto__ 之类一起带进来）。
+ * 返回 { ok, errors, data, counts }。
+ */
+function tfValidateCatalog(input) {
+    let raw = input;
+    if (typeof raw === 'string') {
+        try { raw = JSON.parse(raw); } catch (e) { return { ok: false, errors: [safeT('JSON 解析失败') + '：' + (e?.message || e)] }; }
+    }
+    const errors = [];
+    if (!raw || typeof raw !== 'object') return { ok: false, errors: [safeT('内容不是 JSON 对象')] };
+    if (!Array.isArray(raw.vendors) || !raw.vendors.length) return { ok: false, errors: [safeT('缺少 vendors 数组（或为空）')] };
+
+    // 币种：默认 USD；CNY 必须给 rate，否则按 6.71 折算并提示
+    const cur = String(raw.currency || 'USD').toUpperCase();
+    let rate = 1;
+    if (cur === 'CNY' || cur === 'RMB') {
+        rate = tfNum(raw.rate);
+        if (!rate) { rate = 6.71; errors.push(safeT('CNY 目录未给 rate，已按 1 USD = 6.71 CNY 折算')); }
+    } else if (cur !== 'USD') {
+        // 不认识的币种不硬折算：按 USD 原样入库，但要把这件事说出来
+        errors.push(safeT('未知币种，按 USD 处理') + '：' + cur);
+    }
+
+    const conv = (v) => {
+        if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null;
+        return Math.round((v / rate) * 1e6) / 1e6;
+    };
+
+    const data = {
+        schema: TF_CATALOG_SCHEMA,
+        updatedAt: /^\d{4}-\d{2}-\d{2}$/.test(String(raw.updatedAt || '')) ? String(raw.updatedAt).slice(0, 10) : _todayStr(),
+        currency: 'USD',
+        notes: typeof raw.notes === 'string' ? raw.notes.replace(/[<>]/g, '').slice(0, 600) : '',
+        vendors: [],
+    };
+
+    let modelCount = 0;
+    for (const v of raw.vendors) {
+        if (!v || typeof v !== 'object') continue;
+        const vid = String(v.id || '').trim().slice(0, 40);
+        if (!vid) continue;
+        const vendor = {
+            id: vid,
+            name: String(v.name || vid).replace(/[<>]/g, '').slice(0, 60),
+            site: typeof v.site === 'string' ? v.site.slice(0, 200) : null,
+            sillyTavernSource: typeof v.sillyTavernSource === 'string' ? v.sillyTavernSource.slice(0, 40) : null,
+            models: [],
+        };
+        for (const m of (Array.isArray(v.models) ? v.models : [])) {
+            if (!m || typeof m !== 'object') continue;
+            const mid = String(m.id || '').trim().slice(0, 120);
+            if (!mid) continue;
+            const caps = (Array.isArray(m.capabilities) ? m.capabilities : [])
+                .filter((c) => TF_CATALOG_CAPABILITIES.includes(c));
+            const pricesIn = (m.prices && typeof m.prices === 'object') ? m.prices : {};
+            vendor.models.push({
+                id: mid,
+                label: String(m.label || mid).replace(/[<>]/g, '').slice(0, 80),
+                context: (typeof m.context === 'number' && Number.isFinite(m.context) && m.context > 0) ? Math.round(m.context) : null,
+                maxOutput: (typeof m.maxOutput === 'number' && Number.isFinite(m.maxOutput) && m.maxOutput > 0) ? Math.round(m.maxOutput) : null,
+                capabilities: caps,
+                status: Object.prototype.hasOwnProperty.call(TF_CATALOG_STATUS_NOTE, m.status) ? m.status : 'ga',
+                prices: {
+                    input: conv(pricesIn.input),
+                    output: conv(pricesIn.output),
+                    cached: conv(pricesIn.cached),
+                    perRequest: conv(pricesIn.perRequest),
+                },
+                source: typeof m.source === 'string' ? m.source.slice(0, 200) : null,
+                checkedAt: /^\d{4}-\d{2}-\d{2}$/.test(String(m.checkedAt || '')) ? String(m.checkedAt).slice(0, 10) : data.updatedAt,
+                ...(Array.isArray(m.aliases) ? { aliases: m.aliases.map((x) => String(x).slice(0, 120)).filter(Boolean).slice(0, 12) } : {}),
+            });
+            modelCount++;
+        }
+        if (vendor.models.length) data.vendors.push(vendor);
+    }
+
+    if (!data.vendors.length) return { ok: false, errors: errors.concat([safeT('没有解析出任何厂商/模型')]) };
+
+    // 与当前目录比对：新增 / 覆盖
+    const cur0 = tfCatalogData(getSettings());
+    const curIds = new Set();
+    for (const v of cur0.vendors) for (const m of v.models) curIds.add(v.id + '/' + tfNormModelId(m.id));
+    let added = 0, replaced = 0;
+    const priceTargets = [];
+    for (const v of data.vendors) {
+        for (const m of v.models) {
+            const key = v.id + '/' + tfNormModelId(m.id);
+            if (curIds.has(key)) replaced++; else added++;
+            if (['input', 'output', 'cached'].some((f) => typeof m.prices[f] === 'number')) {
+                const pe = tfCatalogPriceEntry(getSettings(), m);
+                if (pe) priceTargets.push({ m, pe });
+            }
+        }
+    }
+    return {
+        ok: true,
+        errors,
+        data,
+        counts: { vendors: data.vendors.length, models: modelCount, added, replaced, priceTargets: priceTargets.length },
+    };
+}
+
+function renderCatalogImport(container, s) {
+    const box = document.createElement('div');
+    box.className = 'tf-cat-import';
+
+    const hint = document.createElement('div');
+    hint.className = 'tf-writing-hint';
+    hint.textContent = safeT('粘贴一个目录 JSON（或选文件）。字段缺失会补默认值，非法条目逐条报错，旧目录保持不变。');
+    box.appendChild(hint);
+
+    const ta = document.createElement('textarea');
+    ta.className = 'text_pole tf-batch-ta';
+    ta.rows = 6;
+    ta.placeholder = '{"schema":"sillytoken-catalog/v1","updatedAt":"2026-10-30","currency":"USD","vendors":[...]}';
+    ta.value = tfCatalogImportText;
+    ta.addEventListener('input', () => { tfCatalogImportText = ta.value; });
+    box.appendChild(ta);
+
+    const ioRow = document.createElement('div');
+    ioRow.className = 'tf-btn-row';
+
+    // 选文件（离线读本地 JSON，不发请求）
+    const fileBtn = tfButton(safeT('选文件…'), () => {
+        const fi = document.createElement('input');
+        fi.type = 'file';
+        fi.accept = '.json,application/json';
+        fi.addEventListener('change', () => {
+            const f = fi.files && fi.files[0];
+            if (!f) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                tfCatalogImportText = String(reader.result || '');
+                ta.value = tfCatalogImportText;
+                tfCatalogImportResult = tfValidateCatalog(tfCatalogImportText);
+                tfRerenderCatalog(container, s);
+            };
+            reader.readAsText(f);
+        });
+        fi.click();
+    }, 'tf-diag-btn');
+    ioRow.appendChild(fileBtn);
+
+    ioRow.appendChild(tfButton(safeT('解析预览'), () => {
+        tfCatalogImportResult = tfValidateCatalog(ta.value);
+        tfRerenderCatalog(container, s);
+    }, 'tf-diag-btn'));
+    box.appendChild(ioRow);
+
+    if (tfCatalogImportResult) {
+        const res = tfCatalogImportResult;
+        const sum = document.createElement('div');
+        sum.className = 'tf-batch-result';
+        if (!res.ok) {
+            sum.textContent = '✕ ' + safeT('不能导入');
+        } else {
+            sum.textContent = safeT('可导入') + '：' + res.counts.vendors + ' ' + safeT('厂商')
+                + ' / ' + res.counts.models + ' ' + safeT('模型')
+                + '（' + safeT('新增') + ' ' + res.counts.added + '，' + safeT('覆盖') + ' ' + res.counts.replaced + '）'
+                + (res.counts.priceTargets ? ' · ' + safeT('可写入价表') + ' ' + res.counts.priceTargets : '');
+        }
+        box.appendChild(sum);
+        for (const e of res.errors.slice(0, 6)) {
+            const bad = document.createElement('div');
+            bad.className = 'tf-batch-bad';
+            bad.textContent = '⚠ ' + e;
+            box.appendChild(bad);
+        }
+        if (res.ok) {
+            const lab = document.createElement('label');
+            lab.className = 'tf-check';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = tfCatalogImportPrices;
+            cb.addEventListener('change', () => { tfCatalogImportPrices = cb.checked; });
+            lab.appendChild(cb);
+            lab.appendChild(document.createTextNode(' ' + safeT('同时覆盖价表里已存在模型的单价')));
+            box.appendChild(lab);
+            box.appendChild(tfButton(safeT('应用目录'), () => {
+                if (!tfCatalogImportResult || !tfCatalogImportResult.ok) return;
+                tfApplyCatalogImport(tfCatalogImportResult.data, tfCatalogImportPrices);
+                tfCatalogImportOpen = false;
+                tfCatalogImportResult = null;
+                tfRerenderCatalog(container, getSettings());
+            }, 'tf-diag-btn'));
+        }
+    }
+    container.appendChild(box);
+}
+
+function tfApplyCatalogImport(data, updatePrices) {
+    const s = getSettings();
+    s.catalog = data;
+    s.catalogSource = 'imported';
+    s.catalogUpdatedAt = data.updatedAt;
+    s.catalogImportedAt = Date.now();
+    let changedPrices = 0;
+    if (updatePrices) {
+        for (const v of data.vendors) {
+            for (const m of v.models) {
+                const pe = tfCatalogPriceEntry(s, m);
+                if (!pe) continue;
+                let diff = false;
+                for (const f of ['input', 'output', 'cached', 'perRequest']) {
+                    const val = tfNum(m.prices && m.prices[f]);
+                    if (Math.abs(tfNum(pe[f]) - val) > 1e-9) { pe[f] = val; diff = true; }
+                }
+                if (diff) { pe.userEdited = true; changedPrices++; }
+            }
+        }
+    }
+    if (changedPrices) recomputeAllCosts(s);
+    if (changedPrices) tfPriceDraft = null;   // 同上：草稿里有旧价，会被「保存并重算」写回去
+    saveSettingsDebounced();
+    safeUpdateUI();
+    tfLog('info', 'catalog.import', '导入目录', {
+        updatedAt: data.updatedAt, models: data.vendors.reduce((a, v) => a + v.models.length, 0),
+        pricesUpdated: changedPrices,
+    });
+    try {
+        globalThis.Toast?.success?.(safeT('目录已导入') + (changedPrices ? '，' + changedPrices + ' ' + safeT('个模型的价格已更新') : ''), 'SillyToken');
+    } catch { /* ignore */ }
+}
+
+/** 目录页内部重绘（搜索/筛选/导入预览都走这里，避免整页闪一下） */
+function tfRerenderCatalog(container, s) {
+    if (!container) { safeUpdateUI(); return; }
+    const root = (container.classList && container.classList.contains('tf-cat-root'))
+        ? container
+        : container.querySelector('.tf-cat-root');
+    if (root) {
+        // 真正的滚动容器是 .tf-panel-body（面板外壳不动，内容自滚）——存它的 scrollTop
+        const body = document.getElementById('token_flow_panel_body');
+        const top = body ? body.scrollTop : 0;
+        // 搜索框边打字边重绘会把焦点弄丢（打第二个字就跳出输入框）——重绘后接回去
+        const active = document.activeElement;
+        const wasSearch = !!(active && active.classList && active.classList.contains('tf-search'));
+        const caret = wasSearch ? (active.selectionStart || 0) : 0;
+        root.innerHTML = '';
+        renderCatalogSub(root, s || getSettings());
+        if (body) body.scrollTop = top;
+        if (wasSearch) {
+            const el = root.querySelector('.tf-search');
+            if (el) {
+                el.focus();
+                try { el.setSelectionRange(caret, caret); } catch { /* 部分环境不支持 */ }
+            }
+        }
+    } else {
+        safeUpdateUI();
     }
 }
 
