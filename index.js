@@ -14,6 +14,21 @@ import {
     TF_CATALOG_CAPABILITIES,
     TF_CATALOG_STATUS_NOTE,
 } from './catalog.js';
+// v2.11.0：调用日志数据层（逐条流水 → IndexedDB；不进 settings）
+import {
+    TF_CALL_LOG_DEFAULTS,
+    tfCallLogAppend,
+    tfCallLogLoadRecent,
+    tfCallLogClear,
+    tfCallLogPrune,
+    tfCallLogBuildCsv,
+    tfCallLogBuildNdjson,
+    tfCallLogRedact,
+    tfCallLogModelName,
+    tfCallLogDuration,
+    tfCallLogRate,
+    tfCallLogTime,
+} from './calllog.js';
 
 // 安全获取 SillyTavern 上下文（world-backstage 验证过的模式）
 function getContext() {
@@ -142,6 +157,9 @@ const defaultSettings = {
     catalogSource: 'builtin',   // builtin | imported | edited
     catalogUpdatedAt: null,     // 目录数据自带的时间戳（内置时为 null，取内置常量）
     catalogImportedAt: null,    // 本地导入/编辑时刻（毫秒）
+    // ===== v2.11.0：调用日志（逐条流水，落 IndexedDB） =====
+    // 只有配置进 settings；日志本体绝不进 —— 这份设置会被酒馆同步/导出分享
+    callLog: { enabled: true, retentionDays: 90, maxEntries: 20000 },
 };
 
 // v2.9.9：价格字段名（getSettings 兜底与 priceHasValue 共用一份）
@@ -1255,7 +1273,7 @@ function prunePendingCaptures(now = Date.now()) {
  * claimable = true  由宿主函数层创建，等待内层网络层认领
  * claimable = false 由 fetch / XHR 创建；先尝试认领宿主层留下的那条
  */
-function acquireCapture(payload, url, win, claimable) {
+function acquireCapture(payload, url, win, claimable, layer = 'fetch') {
     const messages = normalizeMessages(payload);
     const digest = messagesDigest(messages);
     const now = Date.now();
@@ -1306,6 +1324,12 @@ function acquireCapture(payload, url, win, claimable) {
         claimable: !!claimable,
         claimed: !claimable,
         done: false,
+        // ===== v2.11.0：调用日志埋点（这些字段只给日志层用，不参与计费） =====
+        layer: layer || 'fetch',
+        promptChars: messages.reduce((n, m) => n + ((m && m.text) ? String(m.text).length : 0), 0),
+        ttftMs: null,          // 首个正文 token 的相对毫秒（流式才有）
+        endedAt: 0,            // 结算时刻
+        httpStatus: null,      // 网络层能拿到就填数字，拿不到留 null
     };
     pendingCaptures.push(capture);
     CAPTURE_STATS.seen += 1;
@@ -1329,10 +1353,20 @@ function acquireCapture(payload, url, win, claimable) {
 function finishCapture(capture, options = {}) {
     if (!capture || capture.done) return;
     capture.done = true;
+    // v2.11.0：结束时刻只在这里取一次，三个出口共用（缺了它日志就没有「耗时」）
+    capture.endedAt = Date.now();
 
     if (options.usage) {
         const cost = recordUsage(capture.model, options.usage.in, options.usage.out, options.usage.cached, false, 1, capture.source);
         CAPTURE_STATS.recorded += 1;
+        // v2.11.0：真实 usage → 一条 ok 流水（费用取 recordUsage 算出来的那份）
+        tfPushCallRecord(tfMakeCallRecord(capture, {
+            status: 'ok',
+            usage: options.usage,
+            costUsd: cost ? cost.usd : 0,
+            responseChars: options.outputText ? String(options.outputText).length : 0,
+            meta: options.meta,
+        }));
         tfLog('info', 'capture.recorded', capture.model, {
             layer: capture.url,
             // v2.9.6：把口径打进日志 —— 排查「为什么这条归类不对」不用再猜
@@ -1361,6 +1395,16 @@ function finishCapture(capture, options = {}) {
         if (inTok > 0 || outTok > 0) {
             const cost = recordUsage(capture.model, inTok, outTok, 0, true, 1, capture.source);
             CAPTURE_STATS.estimated += 1;
+            // v2.11.0：估算兜底也记一条，但 estimated=true —— 对账差异正是靠它解释
+            tfPushCallRecord(tfMakeCallRecord(capture, {
+                status: 'ok',
+                inTok, outTok, cachedTok: 0,
+                estimated: true,
+                costUsd: cost ? cost.usd : 0,
+                responseChars: String(options.outputText || '').length,
+                reason,
+                meta: options.meta,
+            }));
             tfLog('warn', 'capture.estimated', capture.model, {
                 layer: capture.url, reason, in: inTok, out: outTok,
                 source: capture.source || '（无标记）',
@@ -1372,6 +1416,12 @@ function finishCapture(capture, options = {}) {
     }
 
     CAPTURE_STATS.missed += 1;
+    // v2.11.0：失败/中止也要留一条，否则「后台显示 200 次、插件 198 次」永远解释不掉
+    tfPushCallRecord(tfMakeCallRecord(capture, {
+        status: (options.meta && options.meta.status) || 'error',
+        reason,
+        meta: options.meta,
+    }));
     pushCaptureMiss(capture.url, capture.model, reason);
     tfLog('warn', 'capture.missed', capture.model, { layer: capture.url, reason });
     prunePendingCaptures();
@@ -1462,8 +1512,15 @@ async function trackStreamResponse(response, capture) {
                     if (json.model) capture.model = json.model;
                     const piece2 = json.choices?.[0]?.delta?.content || json.choices?.[0]?.text || '';
                     if (typeof piece2 === 'string') text += piece2;
+                    // v2.11.0：首个真正产出的 token 才是「首字耗时」；SSE 的 role 空帧不算
+                    if (!capture.ttftMs && typeof piece2 === 'string' && piece2) {
+                        capture.ttftMs = Date.now() - capture.at;
+                    }
                     // 工具调用的参数是分片流过来的，正文为空但它就是这次的输出
                     const calls = json.choices?.[0]?.delta?.tool_calls;
+                    if (!capture.ttftMs && Array.isArray(calls) && calls.length) {
+                        capture.ttftMs = Date.now() - capture.at;
+                    }
                     if (Array.isArray(calls)) {
                         for (const c of calls) {
                             const arg = c && c.function && c.function.arguments;
@@ -1509,9 +1566,15 @@ async function trackStreamResponse(response, capture) {
 
 function trackResponse(response, capture) {
     try {
+        // v2.11.0：状态码留成数字 —— 旧版只把它拼进中文 reason，日志层没法筛
+        if (response && typeof response.status === 'number') capture.httpStatus = response.status;
         // 非 2xx 不计用量，也不走估算（错误响应里那点文本没有计费意义）
         if (response && response.ok === false) {
-            finishCapture(capture, { reason: 'HTTP ' + response.status, estimate: false });
+            finishCapture(capture, {
+                reason: 'HTTP ' + response.status,
+                estimate: false,
+                meta: { httpStatus: response.status, status: 'error' },
+            });
             return;
         }
         const contentType = String(response?.headers?.get?.('content-type') || '').toLowerCase();
@@ -1625,7 +1688,13 @@ function createPatchedFetch(win, state) {
         try {
             response = await pending;
         } catch (error) {
-            finishCapture(capture, { reason: '请求失败: ' + (error?.message || error), estimate: false });
+            // v2.11.0：用户点「停止」是高频操作，不能和真失败混成一个状态
+            const aborted = !!(error && (error.name === 'AbortError' || error.code === 20));
+            finishCapture(capture, {
+                reason: aborted ? '已中止（用户停止或切换）' : ('请求失败: ' + (error?.message || error)),
+                estimate: false,
+                meta: { status: aborted ? 'aborted' : 'error' },
+            });
             throw error;
         }
 
@@ -1679,9 +1748,10 @@ function patchXhrOnWindow(win, state) {
             if (captureEnabled() && isCaptureTarget(requestUrl)) {
                 let payload = null;
                 try { payload = typeof body === 'string' ? JSON.parse(body) : null; } catch { payload = null; }
-                const capture = acquireCapture(payload, requestUrl, win, false);
+                const capture = acquireCapture(payload, requestUrl, win, false, 'xhr');
                 xhr.addEventListener('loadend', () => {
                     try {
+                    capture.httpStatus = xhr.status;
                     if (xhr.status >= 200 && xhr.status < 400) {
                         const json = tryParseJson(xhr.responseText || '');
                         if (!json) {
@@ -1691,7 +1761,11 @@ function patchXhrOnWindow(win, state) {
                         }
                         finishFromBody(capture, json, 'XHR 响应');
                     } else {
-                        finishCapture(capture, { reason: 'XHR 失败：HTTP ' + xhr.status, estimate: false });
+                        finishCapture(capture, {
+                            reason: 'XHR 失败：HTTP ' + xhr.status,
+                            estimate: false,
+                            meta: { httpStatus: xhr.status, status: 'error' },
+                        });
                     }
                     } catch (e) {
                         // v2.9.7（审查 P3）：responseType='json' 时读 responseText 会抛异常，
@@ -1772,7 +1846,7 @@ function patchHostFunctionsOnWindow(win, state) {
     const patched = function patchedGenerateRaw(...args) {
         if (!captureEnabled()) return original.apply(this, args);
         const payload = generateRawArgsToPayload(args);
-        const capture = acquireCapture(payload, 'TavernHelper.generateRaw', win, true);
+        const capture = acquireCapture(payload, 'TavernHelper.generateRaw', win, true, 'host');
 
         let result;
         try {
@@ -1888,7 +1962,18 @@ function makeInput(id, type, initial, oninput) {
  *  UI：统计 Dashboard
  * ============================================================ */
 
+// v2.11.1：自动刷新触发的重绘时间戳（键盘用户正在面板里操作时跳过这一帧）
+let tfAutoRefreshAt = 0;
+
 function updateDashboard() {
+    // 焦点在面板内 + 这一帧来自自动刷新 → 跳过重绘，避免把焦点踢回 body
+    try {
+        if (Date.now() - tfAutoRefreshAt < 2000) {
+            const panelEl = document.getElementById('token_flow_panel');
+            const active = document.activeElement;
+            if (panelEl && active && active !== document.body && panelEl.contains(active)) return;
+        }
+    } catch { /* ignore */ }
     applyTheme();
     // v2.10.0：面板可能从多个入口打开（悬浮球/设置按钮/快捷键/跨设备同步），
     // 每次都把缩放档位同步到 UI —— 只是写一个 CSS 变量 + 一个标签，开销可以忽略。
@@ -2156,20 +2241,30 @@ function updateDashboard() {
     const scrollSaved = (el.scrollTop || 0);
     el.innerHTML = '';
 
-    // v2.9.0：统计 / 管理 双页签。管理页是价格与渠道的唯一编辑入口。
+    // v2.9.0：统计 / 管理 双页签；v2.11.0 增加「记录」（调用日志 + 运行日志）。
+    // 管理页是价格与渠道的唯一编辑入口；记录页只读，两者不要混。
     const tabBar = document.createElement('div');
     tabBar.className = 'tf-tabs';
-    for (const tab of [['stats', '统计'], ['manage', '管理']]) {
+    for (const tab of [['stats', '统计'], ['log', '记录'], ['manage', '管理']]) {
         const b = document.createElement('button');
         b.type = 'button';
         b.className = 'tf-tab-btn' + (tfManageTab === tab[0] ? ' active' : '');
+        b.setAttribute('aria-pressed', String(tfManageTab === tab[0]));
         b.textContent = safeT(tab[1]);
         b.addEventListener('click', () => { if (tfManageTab !== tab[0]) { tfManageTab = tab[0]; safeUpdateUI(); } });
         tabBar.appendChild(b);
     }
     el.appendChild(tabBar);
 
-    if (tfManageTab === 'manage') {
+    if (tfManageTab === 'log') {
+        try {
+            renderLogPage(el, s);
+        } catch (error) {
+            tfLog('error', 'ui.render', '记录页渲染失败: ' + (error?.message || error) + '，本帧回退到统计页');
+            tfManageTab = 'stats';
+            el.appendChild(grid);
+        }
+    } else if (tfManageTab === 'manage') {
         try {
             renderManagePage(el, s);
         } catch (error) {
@@ -2292,7 +2387,7 @@ function quotaRingHTML(pct, used, limit, label, mode, s) {
                 </div>
             </div>
             <div class="tf-ring-meta">
-                <div class="tf-ring-label">${tfEscapeHtml(label)}</div>
+                <div class="tf-ring-label">${tfEscapeHtml(label)}${tone ? ' · <span class="tf-ring-state">' + (tone === 'over' ? safeT('已超额') : safeT('接近上限')) + '</span>' : ''}</div>
                 <div class="tf-ring-desc">${tfEscapeHtml(usedStr)}</div>
                 <div class="tf-ring-reset">🔄 ${safeT('重置')} · ${tfEscapeHtml(fmtClock(s, mode))}</div>
             </div>
@@ -2985,11 +3080,12 @@ function ensureFloatingUI() {
             <span class="tf-orb-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 16.8 8.8 11l3.7 3.7L20.5 6.9"/><path d="M15.2 6.9h5.3v5.3"/></svg></span>
             <span class="tf-orb-badge" id="token_flow_orb_badge" style="display:none"></span>
         </button>
+        <div id="token_flow_live" class="tf-sr-only" role="status" aria-live="polite"></div>
         <div class="tf-panel-scrim" id="token_flow_panel_scrim" style="display:none"></div>
-        <section class="tf-panel" id="token_flow_panel" role="dialog" aria-modal="true" style="display:none">
+        <section class="tf-panel" id="token_flow_panel" role="dialog" aria-modal="true" aria-labelledby="token_flow_panel_title" style="display:none">
             <header class="tf-panel-header">
                 <div class="tf-panel-title">
-                    <b>SillyToken</b>
+                    <b id="token_flow_panel_title">SillyToken</b>
                     <span>${safeT('用量统计')}</span>
                 </div>
                 <div class="tf-panel-header-right">
@@ -3002,7 +3098,7 @@ function ensureFloatingUI() {
                                 title="${safeT('放大面板')}（Alt++）" aria-label="${safeT('放大面板')}">+</button>
                     </div>
                     <div class="tf-theme-switcher" id="token_flow_theme_switcher" title="${safeT('主题')}">
-                        <button class="tf-theme-switch-btn menu_button" type="button" title="${safeT('切换主题')}"><i class="fa-solid fa-palette"></i></button>
+                        <button class="tf-theme-switch-btn menu_button" type="button" title="${safeT('切换主题')}" aria-label="${safeT('切换主题')}"><i class="fa-solid fa-palette" aria-hidden="true"></i></button>
                         <div class="tf-theme-menu" id="token_flow_theme_menu">
                             ${TF_THEMES.map(id =>
                                 `<button type="button" class="tf-theme-menu-item" data-theme-id="${id}" data-theme-name="${safeT(themeNameOf(id))}">${safeT(themeNameOf(id))}</button>`
@@ -3011,12 +3107,12 @@ function ensureFloatingUI() {
                     </div>
                     <div class="tf-panel-actions">
                         <button class="tf-panel-more menu_button tf-more-btn" id="token_flow_more_btn" type="button" title="${safeT('更多操作')}" aria-label="${safeT('更多操作')}" aria-expanded="false"><i class="fa-solid fa-ellipsis"></i></button>
-                        <button class="tf-panel-copy menu_button" id="token_flow_copy_summary" type="button" title="${safeT('复制用量摘要')}"><i class="fa-solid fa-copy"></i></button>
-                        <button class="tf-panel-auto menu_button" id="token_flow_auto_refresh" type="button" title="${safeT('自动刷新')}"><i class="fa-solid fa-rotate"></i></button>
-                        <button class="tf-panel-dl menu_button" id="token_flow_dl_backup" type="button" title="${safeT('导出备份')}"><i class="fa-solid fa-download"></i></button>
-                        <button class="tf-panel-refresh-tick menu_button" id="token_flow_manual_refresh" type="button" title="${safeT('刷新')}"><i class="fa-solid fa-arrows-rotate"></i></button>
-                        <button class="tf-panel-reset menu_button" id="token_flow_reset_session" type="button" title="${safeT('重置会话')}"><i class="fa-solid fa-clock-rotate-left"></i></button>
-                        <button class="tf-panel-close menu_button" id="token_flow_panel_close" type="button" title="${safeT('关闭')}"><i class="fa-solid fa-xmark"></i></button>
+                        <button class="tf-panel-copy menu_button" id="token_flow_copy_summary" type="button" title="${safeT('复制用量摘要')}" aria-label="${safeT('复制用量摘要')}"><i class="fa-solid fa-copy" aria-hidden="true"></i></button>
+                        <button class="tf-panel-auto menu_button" id="token_flow_auto_refresh" type="button" title="${safeT('自动刷新')}" aria-label="${safeT('自动刷新')}" aria-pressed="false"><i class="fa-solid fa-rotate" aria-hidden="true"></i></button>
+                        <button class="tf-panel-dl menu_button" id="token_flow_dl_backup" type="button" title="${safeT('导出备份')}" aria-label="${safeT('导出备份')}"><i class="fa-solid fa-download" aria-hidden="true"></i></button>
+                        <button class="tf-panel-refresh-tick menu_button" id="token_flow_manual_refresh" type="button" title="${safeT('刷新')}" aria-label="${safeT('刷新')}"><i class="fa-solid fa-arrows-rotate" aria-hidden="true"></i></button>
+                        <button class="tf-panel-reset menu_button" id="token_flow_reset_session" type="button" title="${safeT('重置会话')}" aria-label="${safeT('重置会话')}"><i class="fa-solid fa-clock-rotate-left" aria-hidden="true"></i></button>
+                        <button class="tf-panel-close menu_button" id="token_flow_panel_close" type="button" title="${safeT('关闭')}" aria-label="${safeT('关闭')}"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
                     </div>
                 </div>
             </header>
@@ -3156,34 +3252,66 @@ function ensureFloatingUI() {
     orb.addEventListener('pointerup', finishOrbDrag);
     orb.addEventListener('pointercancel', finishOrbDrag);
 
+    // ===== v2.11.1：弹层焦点管理 =====
+    // role=dialog / aria-modal 之前是空声明：打开后焦点仍在 body，背景能被 Tab 进去，
+    // 关闭后焦点丢到 body。这里统一成「记录触发元素 → 焦点进面板 → 关时还原」，
+    // 背景 inert；老 WebView 不支持 inert 时靠 Tab 循环兜底。
+    let tfPanelReturnFocus = null;
+    const tfPanelOpen = () => {
+        if (panel.style.display !== 'none') return;
+        tfPanelReturnFocus = document.activeElement;
+        panel.style.display = 'flex';
+        scrim.style.display = 'block';
+        orb.classList.add('is-open');
+        try { document.body.inert = true; } catch { /* 老 WebView */ }
+        try { (document.getElementById('token_flow_panel_close') || panel).focus(); } catch { /* ignore */ }
+        safeUpdateUI();
+    };
+    const tfPanelClose = () => {
+        if (panel.style.display === 'none') return;
+        panel.style.display = 'none';
+        scrim.style.display = 'none';
+        orb.classList.remove('is-open');
+        try { document.body.inert = false; } catch { /* ignore */ }
+        const back = tfPanelReturnFocus;
+        tfPanelReturnFocus = null;
+        try {
+            // 触发元素按了才记录得到；合成点击/快捷键打开时是 body —— 退回悬浮球
+            if (back && back !== document.body && back.isConnected && typeof back.focus === 'function') back.focus();
+            else if (orb && typeof orb.focus === 'function') orb.focus();
+        } catch { /* ignore */ }
+    };
+    panel.addEventListener('keydown', (e) => {
+        if (e.key !== 'Tab') return;
+        let items = [];
+        try {
+            items = [...panel.querySelectorAll('button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')];
+        } catch { items = []; }
+        if (!items.length) return;
+        const first = items[0], last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    });
+
     // 展开/收起
     orb.addEventListener('click', () => {
         if (orbSuppressClick) return;
-        const open = panel.style.display !== 'none';
-        panel.style.display = open ? 'none' : 'flex';
-        scrim.style.display = open ? 'none' : 'block';
-        orb.classList.toggle('is-open', !open);
-        if (!open) { safeUpdateUI(); }
+        if (panel.style.display === 'none') tfPanelOpen();
+        else tfPanelClose();
     });
-    closeBtn.addEventListener('click', () => {
-        panel.style.display = 'none';
-        scrim.style.display = 'none';
-        orb.classList.remove('is-open');
-    });
-    scrim.addEventListener('click', () => {
-        panel.style.display = 'none';
-        scrim.style.display = 'none';
-        orb.classList.remove('is-open');
-    });
+    closeBtn.addEventListener('click', () => tfPanelClose());
+    scrim.addEventListener('click', () => tfPanelClose());
     // 底部关闭按钮：表头被顶出屏幕时的唯一出路，必须能点
     const closeBottom = document.getElementById('token_flow_panel_close_bottom');
-    if (closeBottom) closeBottom.addEventListener('click', () => {
-        panel.style.display = 'none';
-        scrim.style.display = 'none';
-        orb.classList.remove('is-open');
-    });
+    if (closeBottom) closeBottom.addEventListener('click', () => tfPanelClose());
     refreshBtn.addEventListener('click', safeUpdateUI);
-    resetBtn.addEventListener('click', resetSessionStats);
+    // 重置会话会清空当天累计：先确认（写作域红线：破坏性操作无确认 = 高）
+    resetBtn.addEventListener('click', () => {
+        let yes = false;
+        try { yes = confirm(safeT('重置本次会话统计？此操作不可撤销')); } catch { yes = false; }
+        if (!yes) return;
+        resetSessionStats();
+    });
 
     // ===== v2.10.0：缩放按钮（表头右侧，主题按钮左边） =====
     const zoomOutBtn = document.getElementById('token_flow_zoom_out');
@@ -3257,9 +3385,14 @@ function ensureFloatingUI() {
         let autoTimer = null;
         const applyAutoState = () => {
             const s = getSettings();
+            autoBtn.setAttribute('aria-pressed', String(!!s.autoRefresh));
             if (s.autoRefresh) {
                 autoBtn.classList.add('active');
-                if (!autoTimer) autoTimer = setInterval(safeUpdateUI, (s.autoRefreshInterval || 15) * 1000);
+                if (!autoTimer) autoTimer = setInterval(() => {
+                    // v2.11.1：重绘会把焦点踢回 body，键盘用户每 15s 丢一次位置 —— 标记来源
+                    tfAutoRefreshAt = Date.now();
+                    safeUpdateUI();
+                }, (s.autoRefreshInterval || 15) * 1000);
             } else {
                 autoBtn.classList.remove('active');
                 if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
@@ -3292,9 +3425,7 @@ function ensureFloatingUI() {
     // ESC 关闭 & 面板标题栏拖动
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && panel.style.display !== 'none') {
-            panel.style.display = 'none';
-            scrim.style.display = 'none';
-            orb.classList.remove('is-open');
+            tfPanelClose();
             return;
         }
         // ===== v2.10.0：桌面端缩放缓捷键（面板开着才响应，避免和宿主抢按键） =====
@@ -3651,6 +3782,10 @@ function addExtensionSettingsInto(content) {
     resetAll.textContent = safeT('清空全部数据');
     resetAll.className = 'menu_button';
     resetAll.addEventListener('click', () => {
+        // v2.11.1：清空四块数据且不可恢复，先确认（与「清空调用记录」同一套写法）
+        let yes = false;
+        try { yes = confirm(safeT('清空全部统计与历史？此操作不可撤销')); } catch { yes = false; }
+        if (!yes) return;
         s.stats = structuredClone(defaultSettings.stats);
         s.session = structuredClone(defaultSettings.session);
         // 旧版漏了这几项：总量归零了，但 7 天/30 天/全部视图照样显示全部历史 —— 等于没擦
@@ -3817,7 +3952,7 @@ function addExtensionSettingsInto(content) {
                         saveSettingsDebounced(); updateDashboard();
                         alert(safeT('导入成功'));
                     } else {
-                        alert(safeT('导入失败：格式不合法'));
+                        alert(safeT('导入失败：需要 SillyToken 导出的 JSON。请确认文件未被改动后重试'));
                     }
                 } catch (e) { alert(safeT('导入失败') + ': ' + e.message); }
             };
@@ -3885,6 +4020,9 @@ function initialize() {
         // 安装抓取层（多窗口 + fetch/XHR + 宿主函数，含 iframe）
         if (settings.trackExact) installCaptureLayer();
 
+        // v2.11.0：把历史调用日志读回内存热区 + 按保留策略清理（异步，不阻塞启动）
+        tfHydrateCallLog();
+
         // 事件绑定：优先通过 SILVYTAVERN 全局上下文获取（world-backstage 验证过的模式），
         // 失败则回退到静态 import 的事件源。
         const context = getContext();
@@ -3924,7 +4062,7 @@ function initialize() {
  *  所以日志直接渲染进统计面板，并提供「复制 / 复制诊断 / 清空」。
  * ============================================================ */
 
-const TF_VERSION = '2.10.0';
+const TF_VERSION = '2.11.1';
 const TF_LOG_LIMIT = 400;
 const TF_LOG_VIEW = 60;
 const TF_LOG_STRING_LIMIT = 200;
@@ -3980,6 +4118,178 @@ function tfLogsToText(max = 200) {
             + (entry.details ? ' ' + tfJson(entry.details) : ''));
     }
     return lines.join('\n');
+}
+
+/* ============================================================
+ *  v2.11.0 · 调用日志（逐条流水）
+ *
+ *  链路：finishCapture → tfMakeCallRecord → 内存热区（同步渲染）
+ *        → 1s / 20 条批量 → IndexedDB（异步，失败降级为纯内存）
+ *
+ *  三条边界（别越线）：
+ *    · 正文绝不入库：只留 promptMsgs / promptChars 两个数字
+ *    · 日志不进 settings：settings.json 会同步/导出/分享，日志里有渠道名与错误摘要
+ *    · 写失败不致命：IndexedDB 不可用就只留内存，插件照常工作
+ * ============================================================ */
+
+const TF_CALL_LOG_PAGE = 50;
+let tfCallLogHot = [];         // 内存热区：渲染永远同步读它
+let tfCallLogDirty = [];       // 待落盘队列
+let tfCallLogTimer = null;
+let tfCallLogHydrated = false;
+let tfCallLogStoreOk = null;   // null=未知 true=可写 false=不可用
+let tfCallLogStoreWarned = false;
+let tfCallLogSub = 'calls';    // 'calls' | 'runtime'
+let tfCallLogFilter = 'all';   // all | ok | error | estimated
+let tfCallLogPage = 1;
+let tfCallLogLastUiAt = 0;
+let tfCallLogPushCount = 0;
+
+/** 读配置并收口：settings 里的 callLog 可能被手改成字符串/负数 */
+function tfCallLogConfig(s) {
+    const raw = (s && s.callLog && typeof s.callLog === 'object') ? s.callLog : {};
+    const cfg = Object.assign({}, TF_CALL_LOG_DEFAULTS, raw);
+    cfg.enabled = cfg.enabled !== false;
+    const days = Number(cfg.retentionDays);
+    const max = Number(cfg.maxEntries);
+    cfg.retentionDays = (Number.isFinite(days) && days > 0) ? Math.min(3650, Math.round(days)) : TF_CALL_LOG_DEFAULTS.retentionDays;
+    cfg.maxEntries = (Number.isFinite(max) && max > 0) ? Math.min(200000, Math.round(max)) : TF_CALL_LOG_DEFAULTS.maxEntries;
+    cfg.hotLimit = TF_CALL_LOG_DEFAULTS.hotLimit;
+    return cfg;
+}
+
+/**
+ * 把一条 capture 结算成日志记录。
+ * 白名单构造（绝不 {...capture} 展开）—— capture.messages 是真实 prompt 快照，
+ * 一旦展开就会把正文带进日志。
+ */
+function tfMakeCallRecord(capture, opts = {}) {
+    const meta = opts.meta || {};
+    const usage = opts.usage || null;
+    const startedAt = Number(capture.at) || 0;
+    const endedAt = Number(capture.endedAt) || 0;
+    const duration = (startedAt > 0 && endedAt > 0) ? Math.max(0, endedAt - startedAt) : 0;
+    const modelRaw = tfCallLogModelName(capture.model);
+
+    let channel = null;
+    try {
+        const rules = tfChannelRules(getSettings());
+        channel = (capture.source && rules[capture.source]) ? rules[capture.source] : null;
+    } catch { channel = null; }
+
+    let httpStatus = null;
+    if (meta.httpStatus != null) httpStatus = Number(meta.httpStatus);
+    else if (capture.httpStatus != null) httpStatus = Number(capture.httpStatus);
+    if (!Number.isFinite(httpStatus)) httpStatus = null;
+
+    const claim = capture.claimable ? (capture.claimed ? 'claimed' : 'host-only') : 'direct';
+
+    return {
+        id: String(capture.id || ('tf_' + endedAt + '_' + (++tfCallLogPushCount))),
+        startedAt,
+        endedAt,
+        durationMs: duration,
+        ttftMs: (capture.ttftMs != null && Number.isFinite(Number(capture.ttftMs))) ? Number(capture.ttftMs) : null,
+        modelRaw,
+        modelKey: tfCanonicalModel(modelRaw),
+        sourceKey: capture.source ? String(capture.source).slice(0, 80) : null,
+        channel: channel ? String(channel).slice(0, 24) : null,
+        stream: !!capture.stream,
+        in: usage ? tfNum(usage.in) : tfNum(opts.inTok),
+        out: usage ? tfNum(usage.out) : tfNum(opts.outTok),
+        cached: usage ? tfNum(usage.cached) : tfNum(opts.cachedTok),
+        estimated: !!opts.estimated,
+        requests: 1,
+        costUsd: Number(opts.costUsd || 0),
+        status: opts.status || 'ok',
+        httpStatus,
+        errorCode: meta.errorCode ? String(meta.errorCode).slice(0, 32) : null,
+        errorSummary: opts.reason ? tfCallLogRedact(opts.reason) : (meta.errorSummary ? tfCallLogRedact(meta.errorSummary) : ''),
+        digest: capture.digest || '',
+        promptMsgs: Array.isArray(capture.messages) ? capture.messages.length : 0,
+        promptChars: tfNum(capture.promptChars),
+        responseChars: tfNum(opts.responseChars),
+        layer: capture.layer || 'fetch',
+        claim,
+        appVersion: TF_VERSION,
+    };
+}
+
+/** 写热区 + 排队落盘。单条成本是「一次 push」，不碰 settings、不触发重绘 */
+function tfPushCallRecord(rec) {
+    if (!rec) return;
+    let cfg = null;
+    try { cfg = tfCallLogConfig(getSettings()); } catch { cfg = TF_CALL_LOG_DEFAULTS; }
+    if (!cfg.enabled) return;
+
+    tfCallLogPushCount += 1;
+    tfCallLogHot.push(rec);
+    if (tfCallLogHot.length > cfg.hotLimit) tfCallLogHot.splice(0, tfCallLogHot.length - cfg.hotLimit);
+
+    tfCallLogDirty.push(rec);
+    tfScheduleCallLogFlush(tfCallLogDirty.length >= 20 ? 0 : 1000);
+
+    // 只有当「记录」页正开着时才重绘，且 1.5s 内最多一次 —— 绝不给统计页添负担
+    if (tfManageTab === 'log') {
+        const now = Date.now();
+        if (now - tfCallLogLastUiAt > 1500) { tfCallLogLastUiAt = now; safeUpdateUI(); }
+    }
+}
+
+function tfScheduleCallLogFlush(delay = 1000) {
+    if (tfCallLogTimer) return;
+    tfCallLogTimer = setTimeout(() => { tfCallLogTimer = null; tfFlushCallLog(); }, delay);
+}
+
+function tfFlushCallLog() {
+    const batch = tfCallLogDirty.splice(0, tfCallLogDirty.length);
+    if (!batch.length) return Promise.resolve();
+    return tfCallLogAppend(batch).then((ok) => {
+        tfCallLogStoreOk = !!ok;
+        if (!ok && !tfCallLogStoreWarned) {
+            tfCallLogStoreWarned = true;
+            tfLog('warn', 'calllog.write', '调用日志写不进本机数据库，本次只保留在内存里');
+        }
+    }).catch(() => { tfCallLogStoreOk = false; });
+}
+
+/** 启动时把历史日志读回热区（异步，不阻塞初始化） */
+function tfHydrateCallLog() {
+    if (tfCallLogHydrated) return;
+    tfCallLogHydrated = true;
+    let cfg = null;
+    try { cfg = tfCallLogConfig(getSettings()); } catch { cfg = TF_CALL_LOG_DEFAULTS; }
+    if (!cfg.enabled) return;
+
+    tfCallLogLoadRecent(cfg.hotLimit).then((rows) => {
+        if (!Array.isArray(rows)) { tfCallLogStoreOk = false; return; }
+        tfCallLogStoreOk = true;
+        if (!rows.length) return;
+        const seen = new Set(tfCallLogHot.map((r) => r && r.id));
+        const merged = rows.filter((r) => r && r.id && !seen.has(r.id)).concat(tfCallLogHot);
+        merged.sort((a, b) => (Number(b.startedAt) || 0) - (Number(a.startedAt) || 0));
+        tfCallLogHot = merged.slice(0, cfg.hotLimit);
+        if (tfManageTab === 'log') safeUpdateUI();
+    }).catch(() => { tfCallLogStoreOk = false; });
+
+    tfCallLogPrune(cfg.retentionDays, cfg.maxEntries).then((n) => {
+        if (n > 0) tfLog('info', 'calllog.prune', '按保留策略清理了 ' + n + ' 条旧日志');
+    }).catch(() => {});
+}
+
+function tfClearCallLog() {
+    tfCallLogHot = [];
+    tfCallLogDirty.length = 0;
+    return tfCallLogClear().catch(() => false);
+}
+
+/** 当前筛选后的记录（新 → 旧） */
+function tfCallLogFiltered() {
+    const all = tfCallLogHot.slice().sort((a, b) => (Number(b.startedAt) || 0) - (Number(a.startedAt) || 0));
+    if (tfCallLogFilter === 'estimated') return all.filter((r) => r && r.estimated);
+    if (tfCallLogFilter === 'error') return all.filter((r) => r && r.status !== 'ok');
+    if (tfCallLogFilter === 'ok') return all.filter((r) => r && r.status === 'ok');
+    return all;
 }
 
 function tfWindowHref(win) {
@@ -4267,6 +4577,7 @@ function renderManagePage(container, s) {
         const b = document.createElement('button');
         b.type = 'button';
         b.className = 'tf-subtab-btn' + (tfManageSub === sub[0] ? ' active' : '');
+        b.setAttribute('aria-pressed', String(tfManageSub === sub[0]));
         b.textContent = safeT(sub[1]);
         b.addEventListener('click', () => { if (tfManageSub !== sub[0]) { tfManageSub = sub[0]; safeUpdateUI(); } });
         subbar.appendChild(b);
@@ -4304,6 +4615,7 @@ function renderModelsSub(container, s) {
     search.type = 'search';
     search.className = 'text_pole tf-search';
     search.placeholder = safeT('搜索模型名…');
+    search.setAttribute('aria-label', safeT('搜索模型名'));
     search.value = tfManageQuery;
     search.addEventListener('input', () => {
         tfManageQuery = search.value;
@@ -4363,6 +4675,7 @@ function renderModelsSub(container, s) {
         ta.className = 'text_pole tf-batch-ta';
         ta.rows = 6;
         ta.placeholder = safeT('一行一个模型：名称, 输入, 输出, 缓存[, 按次, 倍率]\n或粘贴 JSON 数组');
+        ta.setAttribute('aria-label', safeT('批量粘贴模型价格'));
         ta.value = tfBatchText;
         ta.addEventListener('input', () => { tfBatchText = ta.value; });
         box.appendChild(ta);
@@ -4526,7 +4839,11 @@ function tfFillModelList(list, s, draft) {
     if (!rows.length) {
         const empty = document.createElement('div');
         empty.className = 'tf-writing-hint';
-        empty.textContent = safeT('列表是空的');
+        // v2.11.1：同一句空态原来同时服务「搜索没结果」和「价表真空」两种情况，
+        // 用户不知道是自己搜错了还是真的没数据 —— 按场景分开写，并给出下一步
+        empty.textContent = q
+            ? safeT('没有匹配「{q}」的模型，清空搜索看全部').replace('{q}', q)
+            : safeT('价格表是空的：点上方「＋添加模型」或「批量粘贴」开始');
         list.appendChild(empty);
         return;
     }
@@ -4538,6 +4855,7 @@ function tfFillModelList(list, s, draft) {
         head.className = 'tf-model-card-head';
         const nameInp = document.createElement('input');
         nameInp.className = 'text_pole tf-card-name';
+        nameInp.setAttribute('aria-label', safeT('模型名'));
         nameInp.value = String(m.name ?? '');
         nameInp.addEventListener('input', () => { m.name = nameInp.value; m.userEdited = true; });
         head.appendChild(nameInp);
@@ -4649,7 +4967,11 @@ function renderChannelsSub(container, s) {
         del.className = 'tf-del';
         del.textContent = '✕';
         del.title = safeT('删除这个渠道');
+        del.setAttribute('aria-label', safeT('删除这个渠道'));
         del.addEventListener('click', () => {
+            let yes = false;
+            try { yes = confirm(safeT('删除这个渠道？它的口径配置会一起移除')); } catch { yes = false; }
+            if (!yes) return;
             s.channels.splice(i, 1);
             onPricesChanged();
         });
@@ -4684,6 +5006,7 @@ function renderChannelsSub(container, s) {
         const nameInp = document.createElement('input');
         nameInp.type = 'text';
         nameInp.className = 'text_pole tf-card-name';
+        nameInp.setAttribute('aria-label', safeT('模型名'));
         nameInp.placeholder = safeT('渠道名，如：opencode 中转');
         const mode = tfNewChannelOpen.mode === 'edit' ? s.channels[tfNewChannelOpen.idx] : null;
         nameInp.value = mode ? mode.name : '';
@@ -4922,6 +5245,7 @@ function renderCatalogSub(container, s) {
     search.type = 'search';
     search.className = 'text_pole tf-search';
     search.placeholder = safeT('搜索厂商或模型…');
+    search.setAttribute('aria-label', safeT('搜索厂商或模型'));
     search.value = tfCatalogQuery;
     search.addEventListener('input', () => { tfCatalogQuery = search.value; tfRerenderCatalog(container, s); });
     toolbar.appendChild(search);
@@ -5603,6 +5927,11 @@ function tfSourceLabel(src) {
 
 function tfNotify(msg) {
     try { globalThis.Toast?.info?.(msg, 'SillyToken'); } catch { /* 没有宿主 Toast 就算了 */ }
+    // v2.11.1：宿主 Toast 是否带 live 语义不受我们控制，这里补一条常驻区域
+    try {
+        const live = document.getElementById('token_flow_live');
+        if (live) live.textContent = String(msg || '');
+    } catch { /* ignore */ }
 }
 
 
@@ -5647,9 +5976,9 @@ function renderPriceWarnings(container, s) {
     container.appendChild(box);
 }
 
-function tfDownload(filename, text) {
+function tfDownload(filename, text, mime = 'application/json') {
     try {
-        const blob = new Blob([text], { type: 'application/json' });
+        const blob = new Blob([text], { type: mime });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -5661,6 +5990,165 @@ function tfDownload(filename, text) {
     } catch (error) {
         tfLog('error', 'log.download', '导出日志失败: ' + (error?.message || error));
     }
+}
+
+/* ---------- v2.11.0：记录页（调用日志 / 运行日志） ---------- */
+
+function tfCallStamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes());
+}
+
+function tfCallRow(r, s) {
+    const row = document.createElement('div');
+    row.className = 'tf-call-row' + (r.status !== 'ok' ? ' tf-call-row-bad' : '');
+
+    const top = document.createElement('div');
+    top.className = 'tf-call-top';
+    const time = document.createElement('span');
+    time.className = 'tf-call-time';
+    const full = tfCallLogTime(r.startedAt);
+    time.textContent = full ? full.slice(11) : '—';
+    time.title = full;
+    const model = document.createElement('span');
+    model.className = 'tf-call-model';
+    model.textContent = r.modelRaw || r.modelKey || '—';
+    model.title = r.modelRaw || '';
+    const cost = document.createElement('span');
+    cost.className = 'tf-call-cost';
+    cost.textContent = fmtMoney(s, Number(r.costUsd) || 0);
+    top.appendChild(time);
+    top.appendChild(model);
+    top.appendChild(cost);
+    row.appendChild(top);
+
+    const meta = document.createElement('div');
+    meta.className = 'tf-call-meta';
+    const bits = [r.stream ? safeT('流') : safeT('非流'), tfCallLogDuration(r.durationMs)];
+    if (r.ttftMs != null) bits.push(safeT('首字') + ' ' + tfCallLogDuration(r.ttftMs));
+    bits.push(fmtTokens(r.in || 0) + ' / ' + fmtTokens(r.out || 0));
+    if (r.channel) bits.push(r.channel);
+    if (r.estimated) bits.push(safeT('估算'));
+    if (r.status === 'aborted') bits.push(safeT('已中止'));
+    else if (r.status !== 'ok') bits.push(safeT('失败') + (r.httpStatus ? ' ' + r.httpStatus : ''));
+    meta.textContent = bits.join(' · ');
+    row.appendChild(meta);
+
+    if (r.errorSummary) {
+        const err = document.createElement('div');
+        err.className = 'tf-call-err';
+        err.textContent = r.errorSummary;
+        row.appendChild(err);
+    }
+    return row;
+}
+
+function renderCallLogList(container, s) {
+    const cfg = tfCallLogConfig(s);
+    const filtered = tfCallLogFiltered();
+    const total = tfCallLogHot.length;
+    const cost = filtered.reduce((n, r) => n + (Number(r.costUsd) || 0), 0);
+
+    const head = document.createElement('div');
+    head.className = 'tf-call-head';
+
+    const title = document.createElement('div');
+    title.className = 'tf-call-title';
+    title.textContent = safeT('调用记录') + ' · ' + total + ' ' + safeT('条')
+        + (filtered.length !== total ? '（' + safeT('筛选后') + ' ' + filtered.length + '）' : '');
+    head.appendChild(title);
+
+    const chips = document.createElement('div');
+    chips.className = 'tf-range-group';
+    for (const f of [['all', '全部'], ['ok', '成功'], ['error', '异常'], ['estimated', '估算']]) {
+        chips.appendChild(tfChip(safeT(f[1]), tfCallLogFilter === f[0], () => {
+            if (tfCallLogFilter === f[0]) return;
+            tfCallLogFilter = f[0];
+            tfCallLogPage = 1;
+            safeUpdateUI();
+        }));
+    }
+    head.appendChild(chips);
+
+    const meta = document.createElement('div');
+    meta.className = 'tf-writing-hint';
+    meta.textContent = safeT('合计') + ' ' + fmtMoney(s, cost)
+        + ' · ' + safeT('保留') + ' ' + cfg.retentionDays + ' ' + safeT('天')
+        + (tfCallLogStoreOk === false ? ' · ' + safeT('本机存储不可用，本次记录只保留在内存') : '');
+    head.appendChild(meta);
+    container.appendChild(head);
+
+    const actions = document.createElement('div');
+    actions.className = 'tf-btn-row';
+    actions.appendChild(tfButton(safeT('导出 CSV'), () => {
+        if (!filtered.length) { tfNotify(safeT('还没有可导出的记录')); return; }
+        tfDownload('sillytoken-calllog_' + tfCallStamp() + '.csv', tfCallLogBuildCsv(filtered), 'text/csv;charset=utf-8');
+    }, 'tf-diag-btn'));
+    actions.appendChild(tfButton(safeT('导出 NDJSON'), () => {
+        if (!filtered.length) { tfNotify(safeT('还没有可导出的记录')); return; }
+        tfDownload('sillytoken-calllog_' + tfCallStamp() + '.ndjson', tfCallLogBuildNdjson(filtered), 'application/x-ndjson');
+    }, 'tf-diag-btn'));
+    actions.appendChild(tfButton(safeT('清空记录'), () => {
+        if (!total) { tfNotify(safeT('还没有调用记录')); return; }
+        let yes = false;
+        try { yes = confirm(safeT('删除全部调用记录？此操作不可撤销')); } catch { yes = false; }
+        if (!yes) return;
+        tfClearCallLog().then(() => {
+            tfCallLogPage = 1;
+            tfNotify(safeT('已清空调用记录'));
+            safeUpdateUI();
+        });
+    }, 'tf-diag-btn'));
+    container.appendChild(actions);
+
+    const list = document.createElement('div');
+    list.className = 'tf-call-list';
+    if (!filtered.length) {
+        const empty = document.createElement('div');
+        empty.className = 'tf-log-empty';
+        empty.textContent = total
+            ? safeT('当前筛选下没有记录')
+            : safeT('还没有调用记录 · 发出一次生成后这里会出现（统计关闭时不记录）');
+        list.appendChild(empty);
+    } else {
+        const rows = filtered.slice(0, tfCallLogPage * TF_CALL_LOG_PAGE);
+        for (const r of rows) list.appendChild(tfCallRow(r, s));
+        container.appendChild(list);
+        if (filtered.length > rows.length) {
+            const more = tfButton(safeT('加载更多') + '（' + rows.length + ' / ' + filtered.length + '）', () => {
+                tfCallLogPage += 1;
+                safeUpdateUI();
+            }, 'tf-diag-btn');
+            more.className += ' tf-call-more';
+            container.appendChild(more);
+        }
+        return;
+    }
+    container.appendChild(list);
+}
+
+function renderLogPage(container, s) {
+    const page = document.createElement('div');
+    page.className = 'tf-manage';
+
+    const subbar = document.createElement('div');
+    subbar.className = 'tf-subtabs';
+    for (const sub of [['calls', '调用记录'], ['runtime', '运行日志']]) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'tf-subtab-btn' + (tfCallLogSub === sub[0] ? ' active' : '');
+        b.setAttribute('aria-pressed', String(tfCallLogSub === sub[0]));
+        b.textContent = safeT(sub[1]);
+        b.addEventListener('click', () => { if (tfCallLogSub !== sub[0]) { tfCallLogSub = sub[0]; safeUpdateUI(); } });
+        subbar.appendChild(b);
+    }
+    page.appendChild(subbar);
+
+    if (tfCallLogSub === 'runtime') renderLogPanel(page, s);
+    else renderCallLogList(page, s);
+
+    container.appendChild(page);
 }
 
 function renderLogPanel(container, s) {
@@ -5714,6 +6202,15 @@ function renderLogPanel(container, s) {
 try {
     globalThis.__sillyTokenDiagnostics = tfDiagnostics;
     globalThis.__sillyTokenLogs = () => tfLogs.slice();
+    // v2.11.0：调用日志的自查入口（手机上没有 DevTools，只能靠这个把现场取出来）
+    globalThis.__sillyTokenCallLog = {
+        list: () => tfCallLogHot.slice(),
+        count: () => tfCallLogHot.length,
+        push: (rec) => tfPushCallRecord(rec),
+        clear: () => tfClearCallLog(),
+        csv: () => tfCallLogBuildCsv(tfCallLogFiltered()),
+        make: (capture, opts) => tfMakeCallRecord(capture, opts),
+    };
 } catch { /* ignore */ }
 
 /* ============================================================
@@ -5928,6 +6425,52 @@ function tfAccumulate(bucket, src, rawName) {
 }
 
 /**
+ * v2.10.1：日明细用的「桶视图」。
+ *
+ * 为什么要有这一层：`days[].models` 以前是把 history 里的原始桶直接透传给渲染层，
+ * 于是脏值（字符串 / NaN / 根本不是对象）会一路直达 DOM；显示调用次数后，
+ * 这些桶会印出 `undefined 次`、`abc 次`。这里一次性归一，并顺手回答两个问题：
+ *   1. req 到底记到没有（reqKnown）—— 旧版本归档的桶可能压根没有 req 字段，
+ *      经 tfNum 后变成 0，若直接显示「0 次」等于断言"这天没调用过"，是假账。
+ *   2. 父桶 req 为 0 但 sources 子桶有值时兜底求和（外部/半合并备份才可能出现）。
+ *
+ * 判据可证明：recordUsage 只在「拿到真实 usage」与「本地估算兜底」两处被调用，
+ * 且 requests 恒为 1，因此本插件任何版本都写不出「有 token 而 req=0」的桶。
+ */
+function tfDayBucketView(entry) {
+    const src = (entry && typeof entry === 'object') ? entry : {};
+    const inTok = tfNum(src.in);
+    const outTok = tfNum(src.out);
+    const cachedTok = tfNum(src.cached);
+    const total = inTok + outTok + cachedTok;
+
+    let req = tfNum(src.req);
+    let reqFromSources = false;
+    if (req === 0 && src.sources && typeof src.sources === 'object') {
+        let summed = 0;
+        for (const key of Object.keys(src.sources)) {
+            const sub = src.sources[key];
+            if (sub && typeof sub === 'object') summed += tfNum(sub.req);
+        }
+        if (summed > 0) { req = summed; reqFromSources = true; }
+    }
+
+    return {
+        in: inTok,
+        out: outTok,
+        cached: cachedTok,
+        cost: tfNum(src.cost),
+        est: tfNum(src.est),
+        unpriced: tfNum(src.unpriced),
+        req,
+        // 有 token 却记不到次数 = 旧数据缺字段，界面显示「—」而不是「0 次」
+        reqKnown: req > 0 || total === 0,
+        reqFromSources,
+        sources: (src.sources && typeof src.sources === 'object') ? src.sources : null,
+    };
+}
+
+/**
  * 聚合当前范围。
  *   今天     —— 用实时 dailyStats（它是滚动的）
  *   其余日子 —— 逐日累加 history 里的按模型用量
@@ -6108,12 +6651,22 @@ function tfAggregateRange(s, range) {
 
     const days = chart.axis.map((date) => {
         const rec = dayMap.get(date);
+        // v2.10.1：按模型桶在这里归一（见 tfDayBucketView），渲染层不再接触原始脏值
+        const rawModels = (rec && rec.models && typeof rec.models === 'object') ? rec.models : {};
+        const models = {};
+        for (const name of Object.keys(rawModels)) models[name] = tfDayBucketView(rawModels[name]);
+        const tokens = rec ? tfNum(rec.tokens) : 0;
+        const req = rec ? tfNum(rec.req) : 0;
         return {
             date,
             cost: rec ? tfNum(rec.cost) : 0,
-            tokens: rec ? tfNum(rec.tokens) : 0,
-            req: (rec && rec.req) || 0,
-            models: (rec && rec.models) || {},
+            tokens,
+            req,
+            // 同样的问题也存在于「日级次数」：旧导入可能没有 req（或写成字符串）
+            reqKnown: req > 0 || tokens === 0,
+            models,
+            hasRecord: !!rec,
+            hasModels: Object.keys(models).length > 0,
         };
     });
 
@@ -6164,6 +6717,8 @@ function tfChip(label, active, onClick) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'tf-range-chip' + (active ? ' active' : '');
+    // v2.11.1：选中态不能只靠颜色 —— 补上 aria-pressed，屏幕阅读器才知道哪个生效
+    btn.setAttribute('aria-pressed', String(!!active));
     btn.textContent = label;
     btn.addEventListener('click', onClick);
     return btn;
@@ -6401,7 +6956,10 @@ function tfRenderChart(container, s, stats) {
         const col = document.createElement('button');
         col.type = 'button';
         col.className = 'tf-chart-col' + (tfSelectedDay === day.date ? ' selected' : '');
-        col.title = day.date + ' · ' + fmtMoney(s, day.cost || 0) + ' · ' + fmtTokens(day.tokens || 0);
+        // v2.10.1：tooltip 与无障碍标签也带上次数（桌面/平板带指针时这是唯一入口）
+        const colReqText = (day.reqKnown === false) ? '—' : (tfNum(day.req) + ' ' + safeT('次'));
+        col.title = day.date + ' · ' + fmtMoney(s, day.cost || 0) + ' · ' + fmtTokens(day.tokens || 0) + ' · ' + colReqText;
+        col.setAttribute('aria-label', day.date + ' ' + safeT('当天明细') + '：' + colReqText);
 
         const bar = document.createElement('div');
         bar.className = 'tf-chart-bar' + ((day.cost || 0) > 0 ? '' : ' empty');
@@ -6740,7 +7298,9 @@ function tfRenderDayDetail(container, s, stats) {
     const left = document.createElement('span');
     left.textContent = day.date;
     const right = document.createElement('span');
-    right.textContent = fmtMoney(s, day.cost || 0) + ' · ' + fmtTokens(day.tokens || 0) + ' · ' + day.req + ' ' + safeT('次');
+    // v2.10.1：次数可能是「没记到」而不是「0 次」，两种情况必须分开显示
+    const dayReqText = (day.reqKnown === false) ? '—' : (tfNum(day.req) + ' ' + safeT('次'));
+    right.textContent = fmtMoney(s, day.cost || 0) + ' · ' + fmtTokens(day.tokens || 0) + ' · ' + dayReqText;
     head.appendChild(left);
     head.appendChild(right);
     box.appendChild(head);
@@ -6754,7 +7314,11 @@ function tfRenderDayDetail(container, s, stats) {
     if (!entries.length) {
         const empty = document.createElement('div');
         empty.className = 'tf-writing-hint';
-        empty.textContent = safeT('这天没有按模型明细');
+        // v2.10.1：以前三种情况共用一句话，导致「今天还没发请求」和「旧数据只有日总额」
+        // 都被说成「没有按模型明细」，用户以为是渲染坏了
+        empty.textContent = !day.hasRecord
+            ? safeT('这天没有任何记录')
+            : (!day.hasModels ? safeT('这天只有日总额，没有按模型明细（旧记录）') : safeT('这天没有按模型明细'));
         box.appendChild(empty);
     }
     entries.sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0));
@@ -6777,9 +7341,17 @@ function tfRenderDayDetail(container, s, stats) {
         // 第二行：和下面明细表同一个口径，省得两处对不上
         const breakdown = document.createElement('div');
         breakdown.className = 'tf-day-detail-breakdown';
+        // v2.10.1：补上这个模型当天的调用次数 —— 数据一直都在桶里，只是从来没画过。
+        // 放在第二行而不是第一行：第一行的模型名靠 ellipsis 截断、右侧数值是 flex:0 0 auto，
+        // 次数塞进第一行会把长模型名压得更短；第二行本来就 word-break，140% 缩放下会自然换行。
+        const reqText = (entry.reqKnown === false)
+            ? '—'
+            : (tfNum(entry.req) + ' ' + safeT('次'));
         breakdown.textContent = safeT('输入') + ' ' + fmtTokens(entry.in || 0)
             + ' · ' + safeT('输出') + ' ' + fmtTokens(entry.out || 0)
-            + ' · ' + safeT('缓存命中') + ' ' + fmtTokens(entry.cached || 0);
+            + ' · ' + safeT('缓存命中') + ' ' + fmtTokens(entry.cached || 0)
+            + ' · ' + reqText
+            + (entry.reqFromSources ? ' ' + safeT('（按来源合计）') : '');
         item.appendChild(breakdown);
 
         box.appendChild(item);
